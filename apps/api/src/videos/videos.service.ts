@@ -4,11 +4,14 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, basename, relative } from "node:path";
 import { VIDEO_STATUS } from "./video.types";
-import type { VideoJob, WorkerResult } from "./video.types";
+import type { DetectionResult, VideoJob, WorkerResult } from "./video.types";
 
 const storageRoot = process.env.STORAGE_ROOT ?? join(process.cwd(), "../../storage");
 const resultRoot = join(storageRoot, "results");
 const workerPath = join(__dirname, "../../../../services/ai-worker/worker.py");
+// Ưu tiên .venv ở thư mục gốc repo (có OpenCV) nếu tồn tại; PYTHON_BIN vẫn được ưu tiên cao nhất.
+const venvPython = join(workerPath, "../../../.venv/bin/python");
+const pythonBin = process.env.PYTHON_BIN ?? (existsSync(venvPython) ? venvPython : "python3");
 
 function isWorkerResult(value: unknown): value is WorkerResult {
   if (typeof value !== "object" || value === null) {
@@ -23,6 +26,7 @@ function isWorkerResult(value: unknown): value is WorkerResult {
 export class VideosService {
   private readonly logger = new Logger(VideosService.name);
   private readonly jobs = new Map<string, VideoJob>();
+  private readonly detectionListeners: ((job: VideoJob, detection: DetectionResult) => void)[] = [];
 
   public constructor() {
     mkdirSync(resultRoot, { recursive: true });
@@ -55,6 +59,28 @@ export class VideosService {
     } catch (error: unknown) {
       this.logger.error("Failed to create video job", error instanceof Error ? error.stack : undefined);
       throw error;
+    }
+  }
+
+  /** Nhận từng biển số ngay khi worker xác nhận (realtime), không chờ video xử lý xong. */
+  public onDetection(listener: (job: VideoJob, detection: DetectionResult) => void): void {
+    this.detectionListeners.push(listener);
+  }
+
+  private handleWorkerEvent(job: VideoJob, detection: DetectionResult): void {
+    const index = job.detections.findIndex((item) => item.trackId !== undefined && item.trackId === detection.trackId);
+    if (index >= 0) {
+      job.detections[index] = detection;
+    } else {
+      job.detections.push(detection);
+    }
+    job.updatedAt = new Date().toISOString();
+    for (const listener of this.detectionListeners) {
+      try {
+        listener(job, detection);
+      } catch (error: unknown) {
+        this.logger.error(`video-job listener failed id=${job.id}`, error instanceof Error ? error.stack : undefined);
+      }
     }
   }
 
@@ -110,7 +136,7 @@ export class VideosService {
 
   private runWorker(id: string, inputPath: string): Promise<WorkerResult> {
     return new Promise((resolve, reject) => {
-      const worker = spawn(process.env.PYTHON_BIN ?? "python3", [workerPath, inputPath, resultRoot, id], {
+      const worker = spawn(pythonBin, [workerPath, inputPath, resultRoot, id], {
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"]
       });
@@ -118,14 +144,25 @@ export class VideosService {
       const stderr: Buffer[] = [];
 
       worker.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+      let pending = "";
       worker.stderr.on("data", (chunk: Buffer) => {
-        stderr.push(chunk);
-        const progressMatches = chunk.toString("utf8").matchAll(/WORKER_PROGRESS=(\d+)/g);
-        for (const match of progressMatches) {
-          const workerProgress = Number(match[1]);
-          const job = this.getJob(id);
-          job.progress = Math.min(95, 10 + Math.round(workerProgress * 0.85));
-          job.updatedAt = new Date().toISOString();
+        const lines = (pending + chunk.toString("utf8")).split("\n");
+        pending = lines.pop() ?? "";
+        const job = this.getJob(id);
+        for (const line of lines) {
+          const progress = /^WORKER_PROGRESS=(\d+)/.exec(line);
+          if (progress !== null) {
+            job.progress = Math.min(95, 10 + Math.round(Number(progress[1]) * 0.85));
+            job.updatedAt = new Date().toISOString();
+          } else if (line.startsWith("WORKER_EVENT=")) {
+            try {
+              this.handleWorkerEvent(job, JSON.parse(line.slice("WORKER_EVENT=".length)) as DetectionResult);
+            } catch (error: unknown) {
+              this.logger.warn(`bad worker event id=${id}: ${error instanceof Error ? error.message : "unknown"}`);
+            }
+          } else if (line.trim() !== "") {
+            stderr.push(Buffer.from(`${line}\n`));
+          }
         }
       });
       worker.on("error", reject);

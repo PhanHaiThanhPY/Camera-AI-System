@@ -13,7 +13,7 @@ NestJS VideosController
 Python worker
   ffprobe metadata
   ffmpeg snapshot + evidence video
-  LPR adapter (demo hiện tại)
+  YOLO biển số + OCR + tracking, chụp ảnh biển/xe/đá
         ↓ JSON stdout
 NestJS VideosService
   cập nhật job
@@ -23,10 +23,10 @@ React + TanStack Query
 
 ## Quyết định giai đoạn đầu
 
-- Job lưu trong memory để giảm thời gian dựng demo; mất khi restart API.
+- Job và lượt xe lưu trong memory; mất khi restart API.
 - File lưu local để dễ trình diễn tại một máy.
 - HTTP polling được dùng cho trạng thái; WebSocket/queue sẽ thêm sau khi luồng nghiệp vụ ổn định.
-- Worker không giả vờ nhận diện thật: demo result được đánh dấu `evidenceMode: "demo"`.
+- Worker phát sự kiện `WORKER_EVENT=` trên stderr cho từng xe; API đẩy realtime qua SSE.
 
 ## Ranh giới mở rộng
 

@@ -13,7 +13,7 @@ Upload video
   → React hiển thị kết quả
 ```
 
-MVP đang bật `AI_DEMO_MODE=true` để kiểm tra toàn bộ luồng. Pipeline LPR thật đã được tích hợp trong worker nhưng cần model detector biển số và các Python dependency tương ứng. Demo mode dùng FFmpeg để lấy snapshot và copy video gốc làm bằng chứng, giúp kết quả trả về nhanh; biển số mẫu mặc định là `DEMO-PLATE`.
+Worker đọc biển số thật từ video: YOLO khoanh vùng biển số → RapidOCR đọc ký tự → gom theo từng xe → chụp ảnh biển số, xe, đá từ frame tốt nhất. Không có chế độ demo/mô phỏng; cân nặng đang random khi chụp được biển số (`WEIGHBRIDGE_MOCK_RANDOM`) cho tới khi nối trạm cân thật.
 
 ## Cấu trúc
 
@@ -39,53 +39,14 @@ Sau đó mở `http://localhost:5173`.
 
 API chạy tại `http://localhost:4000`.
 
-## Bật LPR thật
+## Cài đặt worker
 
 ```bash
-cd services/ai-worker
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/pip install -r services/ai-worker/requirements.txt
+scripts/download-models.sh
 ```
 
-Đặt model detector biển số vào `models/license-plate-detector.pt`, sau đó cập nhật biến môi trường:
+API tự dùng `.venv/bin/python` nếu có. Biến môi trường xem `.env.example`.
 
-```bash
-AI_DEMO_MODE=false
-LPR_MODEL_PATH=./models/license-plate-detector.pt
-LPR_CONFIDENCE=0.35
-LPR_SAMPLE_SECONDS=1.0
-LPR_RENDER_ANNOTATED_VIDEO=false
-```
-
-Model cần trả về bounding box vùng biển số. Worker dùng RapidOCR để đọc ký tự nhiều dòng trong từng vùng, gom các lần phát hiện trùng biển số và tạo ảnh toàn cảnh có khung cùng ảnh crop biển số. Để tăng tốc, video kết quả mặc định giữ nguyên video gốc; đặt `LPR_RENDER_ANNOTATED_VIDEO=true` nếu cần encode video có khung AI.
-
-## Biến môi trường
-
-```bash
-PORT=4000
-STORAGE_ROOT=../../storage
-PYTHON_BIN=python3
-AI_DEMO_MODE=true
-DEMO_PLATE_NUMBER=51C-123.45
-LPR_MODEL_PATH=./models/license-plate-detector.pt
-LPR_CONFIDENCE=0.35
-LPR_SAMPLE_SECONDS=1.0
-LPR_RENDER_ANNOTATED_VIDEO=false
-```
-
-## API MVP
-
-| Method | Endpoint | Mục đích |
-| --- | --- | --- |
-| `POST` | `/api/videos` | Upload video và tạo job |
-| `GET` | `/api/videos` | Danh sách job |
-| `GET` | `/api/videos/:id` | Trạng thái và kết quả job |
-| `GET` | `/api/videos/:id/result` | Chỉ lấy phần detection |
-
-## Bước tiếp theo
-
-1. Đưa job store sang PostgreSQL và queue sang Redis/BullMQ.
-2. Thêm xác nhận thủ công biển số và audit log.
-3. Bổ sung camera RTSP/ONVIF sau khi có video mẫu và vị trí camera thực tế.
-
+Giao diện có 2 menu: **Realtime** (chọn video, nhận diện và hiện kết quả ngay khi xe được xác nhận, khung biển số vẽ trên video) và **Danh sách ảnh đã chụp** (bảng kiểu Excel, mỗi loại ảnh một cột). Chi tiết nghiệp vụ: `docs/gate-control-scope.md`.

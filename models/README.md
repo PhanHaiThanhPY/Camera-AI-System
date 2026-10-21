@@ -1,15 +1,12 @@
-# LPR model
+# Models
 
-Đặt model YOLO detector vùng biển số vào thư mục này, ví dụ:
+Chạy `scripts/download-models.sh` để tải:
 
-```text
-models/license-plate-detector.pt
-```
+| File | Dùng để | Nguồn |
+|---|---|---|
+| `license-plate-detector.pt` | khoanh vùng biển số | Koushim/yolov8-license-plate-detection (MIT) |
+| `yolov8n.pt` | phát hiện xe (car/motorcycle/bus/truck) để cắt ảnh xe, ảnh đá | Ultralytics COCO |
 
-Model phải trả bounding box vùng biển số. Worker sẽ dùng RapidOCR đọc ký tự trong vùng đó.
+Không commit file `.pt`. Đường dẫn đổi qua `LPR_MODEL_PATH`, `VEHICLE_DET_MODEL_PATH`.
 
-Model thử nghiệm được chọn: `Koushim/yolov8-license-plate-detection` trên Hugging Face.
-Model card công bố một class `license_plate` và giấy phép MIT. Tải file `best.pt` rồi đổi tên thành `license-plate-detector.pt`.
-
-Không commit model binary vào Git. Dùng `LPR_MODEL_PATH` để trỏ tới file model.
-
+Loại đá: chưa có model. Đặt `MATERIAL_MODEL_PATH` trỏ tới model phân loại ảnh (YOLO classify) có tên class trùng mã danh mục (`da_bi`, `da_vuong`, `empty`). Khi chưa có, loại đá để "chưa xác định" cho người vận hành chọn.

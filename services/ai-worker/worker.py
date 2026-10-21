@@ -1,20 +1,39 @@
-"""Video worker for the first Camera AI MVP.
+"""Video worker: đọc biển số thật từ video, theo dõi từng xe và chụp bằng chứng.
 
-The default mode is deliberately deterministic so the full upload flow can be
-demoed before a production LPR model and labeled camera footage are available.
-Set AI_DEMO_MODE=false after wiring a real detector into this worker.
+Luồng: YOLO phát hiện biển số → RapidOCR đọc ký tự → gom theo xe (track) → chọn frame tốt nhất
+→ cắt ảnh biển số / xe / hàng từ chính frame đó. Sự kiện được in ra stderr dạng
+`WORKER_EVENT={json}` ngay khi xe được xác nhận để API đẩy realtime; kết quả cuối in ra stdout.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[2]
+# Biển số Việt Nam: 2 số tỉnh + 1–2 chữ + 4–6 số (biển xe máy, ô tô, xe công).
+PLATE_PATTERN = re.compile(os.getenv("LPR_PLATE_REGEX", r"^\d{2}[A-Z]{1,2}\d{4,6}$"))
+VEHICLE_CLASSES = {"car": "car", "motorcycle": "motorcycle", "bus": "bus", "truck": "truck"}
+
+Box = tuple[int, int, int, int]
+
+
+def env_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
+
+def resolve_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT / path
 
 
 def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -24,21 +43,9 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
 def probe_video(input_path: Path) -> dict[str, int | float | None]:
     try:
         result = run_command(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=width,height,duration",
-                "-of",
-                "json",
-                str(input_path),
-            ]
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "json", str(input_path)]
         )
-        payload: Any = json.loads(result.stdout)
-        stream = payload.get("streams", [{}])[0]
+        stream = json.loads(result.stdout).get("streams", [{}])[0]
         return {
             "durationSeconds": float(stream["duration"]) if stream.get("duration") else None,
             "width": int(stream["width"]) if stream.get("width") else None,
@@ -48,38 +55,13 @@ def probe_video(input_path: Path) -> dict[str, int | float | None]:
         return {"durationSeconds": None, "width": None, "height": None}
 
 
-def create_evidence(input_path: Path, output_dir: Path, job_id: str) -> tuple[Path, Path]:
-    job_output_dir = output_dir / job_id
-    job_output_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path = job_output_dir / f"{job_id}-snapshot.jpg"
-    annotated_path = job_output_dir / f"{job_id}-annotated.mp4"
-
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is not None:
-        try:
-            run_command(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-ss",
-                    "0.5",
-                    "-i",
-                    str(input_path),
-                    "-frames:v",
-                    "1",
-                    str(snapshot_path),
-                ]
-            )
-        except (OSError, subprocess.CalledProcessError):
-            shutil.copyfile(input_path, snapshot_path)
-    else:
-        shutil.copyfile(input_path, snapshot_path)
-
-    # Demo mode does not need a second full video encode. Copying preserves the
-    # original quality and makes the result available almost immediately.
-    shutil.copyfile(input_path, annotated_path)
-
-    return snapshot_path, annotated_path
+def link_or_copy(source: Path, target: Path) -> None:
+    """Hard link khi cùng ổ đĩa để không nhân đôi dung lượng video; không được thì copy."""
+    target.unlink(missing_ok=True)
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copyfile(source, target)
 
 
 def normalize_plate(value: str) -> str:
@@ -88,323 +70,461 @@ def normalize_plate(value: str) -> str:
 
 def format_plate(value: str) -> str:
     if re.fullmatch(r"\d{2}[A-Z]\d{5}", value):
-        return f"{value[:3]} {value[3:6]}.{value[6:]}"
+        return f"{value[:3]}-{value[3:6]}.{value[6:]}"
+    if re.fullmatch(r"\d{2}[A-Z]\d{4}", value):
+        return f"{value[:3]}-{value[3:]}"
     return value
 
 
-def find_related_plate(
-    aggregate: dict[str, dict[str, object]],
-    plate: str,
-    event_seconds: float,
-) -> str | None:
-    for aggregate_key, detection in aggregate.items():
-        existing_plate = normalize_plate(str(detection.get("plateNumber", aggregate_key)))
-        last_seconds = float(detection.get("lastDetectedSeconds", event_seconds))
-        if event_seconds - last_seconds > 4.0:
-            continue
-        if existing_plate == plate or existing_plate.endswith(plate) or plate.endswith(existing_plate):
-            return aggregate_key
-    return None
+def format_clock(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes:02d}:{secs:02d}"
 
 
-def timestamp_for_frame(frame_index: int, fps: float) -> str:
-    total_seconds = int(frame_index / max(fps, 1.0))
-    minutes, seconds = divmod(total_seconds, 60)
-    return f"{minutes:02d}:{seconds:02d}"
-
-
-def load_lpr_dependencies() -> tuple[Any, Any, Any]:
-    try:
-        import cv2
-        from ultralytics import YOLO
-    except ImportError as error:
-        raise RuntimeError(
-            "Thiếu dependency LPR. Hãy cài services/ai-worker/requirements.txt "
-            "hoặc bật AI_DEMO_MODE=true."
-        ) from error
-
-    model_path = os.getenv("LPR_MODEL_PATH", "")
-    if not model_path:
-        raise RuntimeError("LPR_MODEL_PATH chưa được cấu hình cho AI_DEMO_MODE=false.")
-
-    configured_model_path = Path(model_path).expanduser()
-    model_candidates = [configured_model_path]
-    if not configured_model_path.is_absolute():
-        model_candidates.append(Path(__file__).resolve().parents[2] / configured_model_path)
-    resolved_model_path = next(
-        (candidate.resolve() for candidate in model_candidates if candidate.exists()),
-        configured_model_path.resolve(),
-    )
-    if not resolved_model_path.exists():
-        raise RuntimeError(f"Không tìm thấy LPR model tại: {resolved_model_path}")
-
-    try:
-        from rapidocr import RapidOCR
-    except ImportError:
-        from rapidocr_onnxruntime import RapidOCR
-
-    return cv2, YOLO(str(resolved_model_path)), RapidOCR()
+# --- OCR -------------------------------------------------------------------------------------
 
 
 def read_ocr_text(ocr_engine: Any, crop: Any) -> tuple[str, float]:
+    """Đọc biển số, ghép biển 2 dòng theo thứ tự dòng trên → dưới, trái → phải."""
     candidates: list[tuple[float, float, str, float]] = []
     ocr_result = ocr_engine(crop)
 
     if isinstance(ocr_result, tuple):
-        legacy_items = ocr_result[0] or []
-        for item in legacy_items:
-            if len(item) < 3:
-                continue
-            text = normalize_plate(str(item[1]))
-            try:
-                confidence = float(item[2])
-            except (TypeError, ValueError):
-                confidence = 0.0
-            box = item[0] if item else []
-            x = min((float(point[0]) for point in box), default=0.0)
-            y = min((float(point[1]) for point in box), default=0.0)
-            if text:
-                candidates.append((y, x, text, confidence))
+        items = ocr_result[0] or []
+        entries = [(item[0], str(item[1]), item[2]) for item in items if len(item) >= 3]
     else:
-        raw_boxes = getattr(ocr_result, "boxes", None)
-        boxes = list(raw_boxes) if raw_boxes is not None else []
-        texts = list(getattr(ocr_result, "txts", []) or [])
-        scores = list(getattr(ocr_result, "scores", []) or [])
-        for index, (text_value, score_value) in enumerate(zip(texts, scores)):
-            text = normalize_plate(str(text_value))
-            try:
-                confidence = float(score_value)
-            except (TypeError, ValueError):
-                confidence = 0.0
-            box = boxes[index] if index < len(boxes) else []
-            x = min((float(point[0]) for point in box), default=float(index))
-            y = min((float(point[1]) for point in box), default=0.0)
-            if text:
-                candidates.append((y, x, text, confidence))
+        boxes = list(getattr(ocr_result, "boxes", None) if getattr(ocr_result, "boxes", None) is not None else [])
+        texts = list(getattr(ocr_result, "txts", None) or [])
+        scores = list(getattr(ocr_result, "scores", None) or [])
+        entries = [(boxes[i] if i < len(boxes) else [], str(texts[i]), scores[i]) for i in range(min(len(texts), len(scores)))]
+
+    for box, raw_text, raw_score in entries:
+        text = normalize_plate(raw_text)
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            score = 0.0
+        if text:
+            x = min((float(p[0]) for p in box), default=0.0)
+            y = min((float(p[1]) for p in box), default=0.0)
+            candidates.append((y, x, text, score))
 
     if not candidates:
         return "", 0.0
-
-    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
-    combined_text = normalize_plate("".join(candidate[2] for candidate in candidates))
-    combined_confidence = sum(candidate[3] for candidate in candidates) / len(candidates)
-    if len(combined_text) >= 4:
-        return combined_text, round(combined_confidence, 4)
-    best_candidate = max(candidates, key=lambda candidate: candidate[3])
-    return best_candidate[2], best_candidate[3]
+    # Biển 2 dòng: gom theo dòng (y gần nhau) rồi sắp trái → phải.
+    heights = [c[0] for c in candidates]
+    line_gap = (max(heights) - min(heights)) / 2 if len(candidates) > 1 else 0
+    candidates.sort(key=lambda c: (round(c[0] / line_gap) if line_gap > 4 else 0, c[1]))
+    text = normalize_plate("".join(c[2] for c in candidates))
+    return text, round(sum(c[3] for c in candidates) / len(candidates), 4)
 
 
-def model_evidence(
-    input_path: Path,
-    output_dir: Path,
-    job_id: str,
-) -> tuple[Path, list[dict[str, object]]]:
-    cv2, detector, ocr_engine = load_lpr_dependencies()
-    job_output_dir = output_dir / job_id
-    job_output_dir.mkdir(parents=True, exist_ok=True)
-    annotated_path = job_output_dir / f"{job_id}-annotated.mp4"
-    raw_annotated_path = job_output_dir / f"{job_id}-annotated-raw.mp4"
-    aggregate: dict[str, dict[str, object]] = {}
+def ocr_plate(cv2: Any, ocr_engine: Any, frame: Any, box: Box) -> tuple[str, float]:
+    """Cắt biển có đệm, phóng to cho biển nhỏ rồi OCR."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    pad_x, pad_y = int((x2 - x1) * 0.08), int((y2 - y1) * 0.15)
+    crop = frame[max(y1 - pad_y, 0) : min(y2 + pad_y, height), max(x1 - pad_x, 0) : min(x2 + pad_x, width)]
+    if crop.size == 0:
+        return "", 0.0
+    target_width = 240
+    if crop.shape[1] < target_width:
+        scale = target_width / crop.shape[1]
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return read_ocr_text(ocr_engine, crop)
 
-    capture = cv2.VideoCapture(str(input_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Không thể mở video: {input_path}")
 
-    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    sample_seconds = max(float(os.getenv("LPR_SAMPLE_SECONDS", "1.0")), 0.1)
-    sample_interval = max(int(round(fps * sample_seconds)), 1)
-    confidence_threshold = float(os.getenv("LPR_CONFIDENCE", "0.35"))
-    render_annotated = os.getenv("LPR_RENDER_ANNOTATED_VIDEO", "false").lower() == "true"
-    writer = cv2.VideoWriter(
-        str(raw_annotated_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    ) if render_annotated else None
-    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    progress_interval = max(int(total_frames * 0.05), 1)
-    active_boxes: list[tuple[int, int, int, int, str, float]] = []
-    frame_index = 0
+# --- Hình học --------------------------------------------------------------------------------
 
-    try:
-        while True:
-            success, frame = capture.read()
-            if not success:
-                break
 
-            if frame_index % sample_interval == 0:
-                active_boxes = []
-                predictions = detector(frame, conf=confidence_threshold, verbose=False)
-                for prediction in predictions:
-                    if prediction.boxes is None:
-                        continue
+def clamp_box(box: tuple[float, float, float, float], frame_size: tuple[int, int]) -> Box:
+    width, height = frame_size
+    x1, y1, x2, y2 = box
+    return (
+        int(min(max(x1, 0), width - 1)),
+        int(min(max(y1, 0), height - 1)),
+        int(min(max(x2, 1), width)),
+        int(min(max(y2, 1), height)),
+    )
 
-                    boxes = prediction.boxes.xyxy.cpu().tolist()
-                    scores = prediction.boxes.conf.cpu().tolist()
-                    timestamp = timestamp_for_frame(frame_index, fps)
-                    for coordinates, detector_score in zip(boxes, scores):
-                        x1, y1, x2, y2 = [max(int(value), 0) for value in coordinates]
-                        x2 = min(x2, width)
-                        y2 = min(y2, height)
-                        crop = frame[y1:y2, x1:x2]
-                        if crop.size == 0:
-                            continue
 
-                        plate, ocr_score = read_ocr_text(ocr_engine, crop)
-                        if not plate:
-                            continue
+def iou(first: Box, second: Box) -> float:
+    ix1, iy1 = max(first[0], second[0]), max(first[1], second[1])
+    ix2, iy2 = min(first[2], second[2]), min(first[3], second[3])
+    inter = max(ix2 - ix1, 0) * max(iy2 - iy1, 0)
+    union = (first[2] - first[0]) * (first[3] - first[1]) + (second[2] - second[0]) * (second[3] - second[1]) - inter
+    return inter / union if union > 0 else 0.0
 
-                        score = round(float(detector_score) * max(ocr_score, 0.01), 4)
-                        event_seconds = round(frame_index / max(fps, 1.0), 2)
-                        aggregate_key = find_related_plate(aggregate, plate, event_seconds) or plate
-                        display_plate = format_plate(plate)
-                        active_boxes.append((x1, y1, x2, y2, display_plate, score))
-                        current_confidence = float(aggregate.get(aggregate_key, {}).get("confidence", 0.0))
-                        is_best_evidence = aggregate_key not in aggregate or score > current_confidence
-                        if aggregate_key not in aggregate:
-                            aggregate[aggregate_key] = {
-                                "plateNumber": display_plate,
-                                "confidence": score,
-                                "firstDetectedAt": timestamp,
-                                "lastDetectedAt": timestamp,
-                                "lastDetectedSeconds": event_seconds,
-                                "evidenceSeconds": event_seconds,
-                                "evidenceMode": "model",
-                            }
-                        else:
-                            aggregate[aggregate_key]["lastDetectedAt"] = timestamp
-                            aggregate[aggregate_key]["lastDetectedSeconds"] = event_seconds
-                            aggregate[aggregate_key]["confidence"] = max(
-                                float(aggregate[aggregate_key]["confidence"]), score
-                            )
-                            if len(plate) > len(normalize_plate(str(aggregate[aggregate_key]["plateNumber"]))):
-                                aggregate[aggregate_key]["plateNumber"] = display_plate
 
-                        if is_best_evidence:
-                            snapshot_path = job_output_dir / f"plate-{aggregate_key}.jpg"
-                            overview_path = job_output_dir / f"event-{aggregate_key}.jpg"
-                            evidence_frame = frame.copy()
-                            cv2.rectangle(evidence_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                            cv2.putText(
-                                evidence_frame,
-                                f"{plate} {score:.2f}",
-                                (x1, max(y1 - 12, 24)),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.9,
-                                (0, 255, 0),
-                                2,
-                            )
-                            cv2.imwrite(str(snapshot_path), crop)
-                            cv2.imwrite(str(overview_path), evidence_frame)
-                            aggregate[aggregate_key]["evidenceSeconds"] = event_seconds
-                            aggregate[aggregate_key]["evidenceSnapshotUrl"] = (
-                                f"/storage/results/{job_id}/{overview_path.name}"
-                            )
+def order_quad(points: Any) -> list[list[float]]:
+    """Sắp xếp 4 điểm theo thứ tự TL, TR, BR, BL."""
+    pts = sorted(([float(p[0]), float(p[1])] for p in points), key=lambda p: p[1])
+    top = sorted(pts[:2], key=lambda p: p[0])
+    bottom = sorted(pts[2:], key=lambda p: p[0], reverse=True)
+    return [top[0], top[1], bottom[0], bottom[1]]
 
-            if render_annotated and writer is not None:
-                for x1, y1, x2, y2, plate, score in active_boxes:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(
-                        frame,
-                        f"{plate} {score:.2f}",
-                        (x1, max(y1 - 8, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (0, 255, 0),
-                        2,
-                    )
-                writer.write(frame)
-            if frame_index % progress_interval == 0 and total_frames > 0:
-                progress = int((frame_index / total_frames) * 100)
-                print(f"WORKER_PROGRESS={progress}", file=sys.stderr, flush=True)
-            frame_index += 1
-    finally:
-        capture.release()
-        if writer is not None:
-            writer.release()
 
-    ffmpeg = shutil.which("ffmpeg")
-    if not render_annotated:
-        shutil.copyfile(input_path, annotated_path)
-    elif ffmpeg is not None:
+def find_plate_region(cv2: Any, frame: Any, box: Box, frame_size: tuple[int, int]) -> dict[str, Any]:
+    """Khoanh tứ giác biển số (toạ độ chuẩn hoá); không tìm được contour tin cậy thì dùng khung detector."""
+    import numpy as np
+
+    x1, y1, x2, y2 = box
+    frame_width, frame_height = frame_size
+    quad = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+    source = "model-bbox"
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size > 0:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        edges = cv2.dilate(cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 60, 160), np.ones((2, 2), np.uint8))
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(contour) >= 0.45 * crop.shape[0] * crop.shape[1]:
+                approx = cv2.approxPolyDP(contour, 0.04 * cv2.arcLength(contour, True), True)
+                candidate = approx.reshape(-1, 2) if len(approx) == 4 else cv2.boxPoints(cv2.minAreaRect(contour))
+                quad = [[px + x1, py + y1] for px, py in order_quad(candidate)]
+                source = "model-contour"
+
+    return {
+        "points": [[round(min(max(px / frame_width, 0.0), 1.0), 5), round(min(max(py / frame_height, 0.0), 1.0), 5)] for px, py in quad],
+        "frameWidth": frame_width,
+        "frameHeight": frame_height,
+        "source": source,
+    }
+
+
+def estimate_vehicle_box(plate_box: Box, frame_size: tuple[int, int]) -> Box:
+    """Dự phòng khi model xe không thấy xe: ước lượng từ biển (biển ≈ 1/5 thân xe, nằm gần đáy xe)."""
+    x1, y1, x2, y2 = plate_box
+    center_x = (x1 + x2) / 2
+    plate_width, plate_height = max(x2 - x1, 1), max(y2 - y1, 1)
+    vehicle_width = plate_width * env_float("VEHICLE_WIDTH_PLATE_RATIO", 5)
+    bottom = y2 + plate_height * 1.2
+    return clamp_box((center_x - vehicle_width / 2, bottom - vehicle_width * 0.8, center_x + vehicle_width / 2, bottom), frame_size)
+
+
+def detect_vehicle(model: Any | None, frame: Any, plate_box: Box) -> tuple[Box, str, float] | None:
+    """Xe nhỏ nhất chứa tâm biển số (COCO car/motorcycle/bus/truck) → (box, mã loại xe, độ tin cậy)."""
+    if model is None:
+        return None
+    center_x, center_y = (plate_box[0] + plate_box[2]) / 2, (plate_box[1] + plate_box[3]) / 2
+    best: tuple[float, Box, str, float] | None = None
+    result = model(frame, conf=0.25, verbose=False)[0]
+    if result.boxes is None:
+        return None
+    for coordinates, class_id, score in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.cls.cpu().tolist(), result.boxes.conf.cpu().tolist()):
+        code = VEHICLE_CLASSES.get(str(result.names[int(class_id)]))
+        x1, y1, x2, y2 = coordinates
+        if code is not None and x1 <= center_x <= x2 and y1 <= center_y <= y2:
+            area = (x2 - x1) * (y2 - y1)
+            if best is None or area < best[0]:
+                best = (area, (int(x1), int(y1), int(x2), int(y2)), code, float(score))
+    return (best[1], best[2], best[3]) if best is not None else None
+
+
+def normalize_box(box: Box, frame_size: tuple[int, int], source: str) -> dict[str, Any]:
+    width, height = frame_size
+    return {"box": [round(box[0] / width, 5), round(box[1] / height, 5), round(box[2] / width, 5), round(box[3] / height, 5)], "source": source}
+
+
+# --- Track -----------------------------------------------------------------------------------
+
+
+@dataclass
+class Observation:
+    seconds: float
+    frame_index: int
+    box: Box
+    text: str
+    ocr: float
+    det: float
+
+    @property
+    def valid(self) -> bool:
+        return bool(PLATE_PATTERN.match(self.text))
+
+    @property
+    def score(self) -> float:
+        area = max((self.box[2] - self.box[0]) * (self.box[3] - self.box[1]), 1)
+        return self.ocr * self.det * math.sqrt(area)
+
+
+@dataclass
+class Track:
+    track_id: int
+    observations: list[Observation] = field(default_factory=list)
+    trail: list[Observation] = field(default_factory=list)
+    best_frame: Any = None
+    best: Observation | None = None
+    emitted: int = 0
+
+    @property
+    def last(self) -> Observation:
+        return self.trail[-1]
+
+    def valid_observations(self) -> list[Observation]:
+        return [o for o in self.observations if o.valid]
+
+    def vote(self) -> str:
+        weights: dict[str, float] = defaultdict(float)
+        for obs in self.valid_observations():
+            weights[obs.text] += obs.ocr * obs.det
+        return max(weights, key=weights.get) if weights else ""  # type: ignore[arg-type]
+
+    def confirmed(self, min_ocr: float) -> bool:
+        valid = self.valid_observations()
+        text = self.vote()
+        agreeing = [o for o in valid if o.text == text]
+        return len(agreeing) >= 2 or any(o.ocr >= max(min_ocr, 0.9) for o in agreeing)
+
+    def add(self, obs: Observation, frame: Any) -> None:
+        self.trail.append(obs)
+        if obs.valid:
+            self.observations.append(obs)
+            if self.best is None or obs.score > self.best.score:
+                self.best, self.best_frame = obs, frame.copy()
+
+
+class Pipeline:
+    def __init__(self, job_id: str, output_dir: Path) -> None:
+        import cv2
+        from ultralytics import YOLO
+
         try:
-            run_command(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-i",
-                    str(raw_annotated_path),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-crf",
-                    "28",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                    "-an",
-                    str(annotated_path),
-                ]
+            from rapidocr import RapidOCR
+        except ImportError:
+            from rapidocr_onnxruntime import RapidOCR
+
+        self.cv2 = cv2
+        self.job_id = job_id
+        self.job_dir = output_dir / job_id
+        self.job_dir.mkdir(parents=True, exist_ok=True)
+
+        plate_model = resolve_path(os.getenv("LPR_MODEL_PATH", "models/license-plate-detector.pt"))
+        if not plate_model.exists():
+            raise RuntimeError(f"Không tìm thấy model biển số tại {plate_model}. Xem models/README.md để tải.")
+        self.plate_detector = YOLO(str(plate_model))
+        self.ocr = RapidOCR()
+        vehicle_model = resolve_path(os.getenv("VEHICLE_DET_MODEL_PATH", "models/yolov8n.pt"))
+        self.vehicle_detector = YOLO(str(vehicle_model)) if vehicle_model.exists() else None
+        material_path = os.getenv("MATERIAL_MODEL_PATH", "")
+        self.material_model = YOLO(str(resolve_path(material_path))) if material_path else None
+
+        self.confidence = env_float("LPR_CONFIDENCE", 0.3)
+        self.imgsz = int(env_float("LPR_IMGSZ", 1280))
+        self.min_ocr = env_float("LPR_MIN_OCR", 0.5)
+        self.timeout = env_float("LPR_TRACK_TIMEOUT", 1.5)
+        self.load_fraction = env_float("LOAD_REGION_TOP_FRACTION", 0.5)
+        self.tracks: list[Track] = []
+        self.active: list[Track] = []
+        self.finished: list[dict[str, Any]] = []
+        self.next_id = 1
+
+    # Gán quan sát cho track đang hoạt động theo vị trí; xe vào lại cùng biển trong vài giây thì nối vào track cũ.
+    def assign(self, obs: Observation) -> Track | None:
+        best: tuple[float, Track] | None = None
+        for track in self.active:
+            if obs.seconds - track.last.seconds > self.timeout:
+                continue
+            overlap = iou(track.last.box, obs.box)
+            width = max(obs.box[2] - obs.box[0], 1)
+            cx, cy = (obs.box[0] + obs.box[2]) / 2, (obs.box[1] + obs.box[3]) / 2
+            lx, ly = (track.last.box[0] + track.last.box[2]) / 2, (track.last.box[1] + track.last.box[3]) / 2
+            distance = math.hypot(cx - lx, cy - ly) / width
+            closeness = overlap if overlap > 0.05 else (1.0 - distance / 2.5 if distance < 2.5 else 0.0)
+            if closeness > 0 and (best is None or closeness > best[0]):
+                best = (closeness, track)
+        if best is not None:
+            return best[1]
+        if obs.valid:
+            for track in self.active:
+                if track.vote() == obs.text and obs.seconds - track.last.seconds <= 6.0:
+                    return track
+        return None
+
+    def build_detection(self, track: Track, size: tuple[int, int], final: bool) -> dict[str, Any] | None:
+        cv2 = self.cv2
+        best, frame = track.best, track.best_frame
+        text = track.vote()
+        if best is None or frame is None or not text:
+            return None
+        # Frame tốt nhất theo đúng biển số đã bình chọn.
+        agreeing = [o for o in track.valid_observations() if o.text == text]
+        best = max(agreeing, key=lambda o: o.score)
+        width, height = size
+        key = f"t{track.track_id}"
+        plate_box = best.box
+
+        vehicle = detect_vehicle(self.vehicle_detector, frame, plate_box)
+        if vehicle is not None:
+            vehicle_box, vehicle_code, vehicle_conf = vehicle
+            box_source = "model"
+            vehicle_type = {"code": vehicle_code, "confidence": round(vehicle_conf, 4), "source": "model"}
+        else:
+            vehicle_box, box_source = estimate_vehicle_box(plate_box, size), "heuristic"
+            vehicle_type = {"code": None, "confidence": None, "source": "unavailable"}
+
+        # Chỉ xe tải mới có thùng hàng để chụp ảnh đá.
+        load_box: Box | None = None
+        if vehicle_type["code"] == "truck":
+            load_box = clamp_box(
+                (vehicle_box[0], vehicle_box[1], vehicle_box[2], vehicle_box[1] + (vehicle_box[3] - vehicle_box[1]) * self.load_fraction), size
             )
-            raw_annotated_path.unlink(missing_ok=True)
-        except (OSError, subprocess.CalledProcessError):
-            raw_annotated_path.replace(annotated_path)
-    else:
-        raw_annotated_path.replace(annotated_path)
 
-    detections: list[dict[str, object]] = []
-    for plate, detection in aggregate.items():
-        snapshot_path = job_output_dir / f"plate-{plate}.jpg"
-        detections.append(
-            {
-                **detection,
-                "snapshotUrl": f"/storage/results/{job_id}/{snapshot_path.name}",
-            }
-        )
+        version = track.emitted + 1
+        prefix = f"/storage/results/{self.job_id}"
+        crops = {"plate": plate_box, "vehicle": vehicle_box}
+        if load_box is not None:
+            crops["load"] = load_box
+        urls: dict[str, str | None] = {"plate": None, "vehicle": None, "load": None}
+        for name, (x1, y1, x2, y2) in crops.items():
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            if name == "plate" and crop.shape[1] < 240:
+                scale = 240 / crop.shape[1]
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            file_name = f"{name}-{key}.jpg"
+            cv2.imwrite(str(self.job_dir / file_name), crop)
+            urls[name] = f"{prefix}/{file_name}?v={version}"
 
-    return annotated_path, detections
+        material: dict[str, Any] = {"code": None, "confidence": None, "source": "unavailable"}
+        if load_box is not None and self.material_model is not None:
+            load_crop = frame[load_box[1] : load_box[3], load_box[0] : load_box[2]]
+            result = self.material_model(load_crop, verbose=False)[0]
+            if getattr(result, "probs", None) is not None:
+                material = {"code": str(result.names[int(result.probs.top1)]), "confidence": round(float(result.probs.top1conf), 4), "source": "model"}
+
+        overview = frame.copy()
+        for name, color in (("vehicle", (0, 215, 255)), ("load", (0, 140, 255))):
+            if name in crops:
+                x1, y1, x2, y2 = crops[name]
+                cv2.rectangle(overview, (x1, y1), (x2, y2), color, 2)
+        region = find_plate_region(cv2, frame, plate_box, size)
+        points = [[int(px * width), int(py * height)] for px, py in region["points"]]
+        import numpy as np
+
+        cv2.polylines(overview, [np.array(points, dtype="int32")], True, (0, 255, 0), 2)
+        cv2.putText(overview, format_plate(text), (plate_box[0], max(plate_box[1] - 8, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        overview_name = f"event-{key}.jpg"
+        cv2.imwrite(str(self.job_dir / overview_name), overview)
+
+        track.emitted = version
+        first = track.trail[0].seconds
+        last = track.trail[-1].seconds
+        return {
+            "trackId": key,
+            "plateNumber": format_plate(text),
+            "confidence": round(best.det * best.ocr, 4),
+            "detectorConfidence": round(best.det, 4),
+            "ocrConfidence": round(best.ocr, 4),
+            "firstDetectedAt": format_clock(first),
+            "lastDetectedAt": format_clock(last),
+            "evidenceSeconds": round(best.seconds, 2),
+            "frameIndex": best.frame_index,
+            "snapshotUrl": urls["plate"],
+            "evidenceSnapshotUrl": f"{prefix}/{overview_name}?v={version}",
+            "vehicleImageUrl": urls["vehicle"],
+            "loadImageUrl": urls["load"],
+            "vehicleBox": normalize_box(vehicle_box, size, box_source),
+            "loadBox": normalize_box(load_box, size, box_source) if load_box is not None else None,
+            "plateRegion": region,
+            "vehicleType": vehicle_type,
+            "material": material,
+            "evidenceMode": "model",
+            "final": final,
+            "trail": [[round(o.seconds, 2), *normalize_box(o.box, size, "model")["box"]] for o in track.trail],
+        }
+
+    def emit(self, detection: dict[str, Any]) -> None:
+        print(f"WORKER_EVENT={json.dumps(detection)}", file=sys.stderr, flush=True)
+
+    def finalize(self, track: Track, size: tuple[int, int]) -> None:
+        if track in self.active:
+            self.active.remove(track)
+        if not track.confirmed(self.min_ocr):
+            return
+        detection = self.build_detection(track, size, final=True)
+        if detection is not None:
+            self.finished.append(detection)
+            self.emit(detection)
+
+    def run(self, input_path: Path) -> dict[str, Any]:
+        cv2 = self.cv2
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise RuntimeError(f"Không thể mở video: {input_path}")
+        fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        size = (width, height)
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        step = max(int(round(fps * env_float("LPR_SAMPLE_SECONDS", 0.5))), 1)
+        progress_every = max(total // 20, 1)
+        frame_index = 0
+
+        try:
+            while True:
+                if not capture.grab():
+                    break
+                if frame_index % step == 0:
+                    success, frame = capture.retrieve()
+                    if success:
+                        self.process_frame(frame, frame_index, fps, size)
+                if total > 0 and frame_index % progress_every == 0:
+                    print(f"WORKER_PROGRESS={int(frame_index / total * 100)}", file=sys.stderr, flush=True)
+                frame_index += 1
+        finally:
+            capture.release()
+        for track in list(self.active):
+            self.finalize(track, size)
+        return {"width": width, "height": height, "fps": fps, "detections": self.finished}
+
+    def process_frame(self, frame: Any, frame_index: int, fps: float, size: tuple[int, int]) -> None:
+        seconds = frame_index / max(fps, 1.0)
+        for track in list(self.active):
+            if seconds - track.last.seconds > self.timeout:
+                self.finalize(track, size)
+
+        result = self.plate_detector(frame, conf=self.confidence, imgsz=self.imgsz, verbose=False)[0]
+        if result.boxes is None:
+            return
+        for coordinates, det in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist()):
+            box = clamp_box(tuple(coordinates), size)  # type: ignore[arg-type]
+            if box[2] - box[0] < 12 or box[3] - box[1] < 6:
+                continue
+            text, ocr = ocr_plate(self.cv2, self.ocr, frame, box)
+            obs = Observation(seconds, frame_index, box, text if ocr >= self.min_ocr else "", ocr, float(det))
+            track = self.assign(obs)
+            if track is None:
+                if not obs.valid:
+                    continue
+                track = Track(self.next_id)
+                self.next_id += 1
+                self.active.append(track)
+            track.add(obs, frame)
+            if track.emitted == 0 and track.confirmed(self.min_ocr):
+                detection = self.build_detection(track, size, final=False)
+                if detection is not None:
+                    self.emit(detection)
 
 
 def main() -> None:
     if len(sys.argv) != 4:
         raise ValueError("Usage: worker.py <input_path> <result_root> <job_id>")
-
     input_path = Path(sys.argv[1]).resolve()
     result_root = Path(sys.argv[2]).resolve()
     job_id = sys.argv[3]
+
     metadata = probe_video(input_path)
-    demo_mode = os.getenv("AI_DEMO_MODE", "true").lower() != "false"
-
-    if demo_mode:
-        snapshot_path, annotated_path = create_evidence(input_path, result_root, job_id)
-        detections: list[dict[str, object]] = [
-            {
-                "plateNumber": os.getenv("DEMO_PLATE_NUMBER", "DEMO-PLATE"),
-                "confidence": 0.91,
-                "firstDetectedAt": "00:00",
-                "lastDetectedAt": "00:05",
-                "evidenceSeconds": 0,
-                "snapshotUrl": f"/storage/results/{job_id}/{snapshot_path.name}",
-                "evidenceSnapshotUrl": f"/storage/results/{job_id}/{snapshot_path.name}",
-                "evidenceMode": "demo",
-            }
-        ]
-    else:
-        annotated_path, detections = model_evidence(input_path, result_root, job_id)
-
-    print(
-        json.dumps(
-            {
-                **metadata,
-                "annotatedVideoPath": str(annotated_path),
-                "detections": detections,
-            }
-        )
-    )
+    pipeline = Pipeline(job_id, result_root)
+    result = pipeline.run(input_path)
+    annotated_path = pipeline.job_dir / f"{job_id}-annotated.mp4"
+    link_or_copy(input_path, annotated_path)
+    if metadata["width"] is None:
+        metadata["width"], metadata["height"] = result["width"], result["height"]
+    print(json.dumps({**metadata, "annotatedVideoPath": str(annotated_path), "detections": result["detections"]}))
 
 
 if __name__ == "__main__":
@@ -413,4 +533,3 @@ if __name__ == "__main__":
     except Exception as error:  # noqa: BLE001
         print(str(error), file=sys.stderr)
         sys.exit(1)
-
