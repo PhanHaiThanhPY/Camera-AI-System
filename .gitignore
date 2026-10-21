@@ -1,0 +1,16 @@
+node_modules/
+.venv/
+.venv312/
+dist/
+.vite/
+.env
+.env.*
+!.env.example
+storage/uploads/*
+storage/results/*
+!storage/uploads/.gitkeep
+!storage/results/.gitkeep
+models/*.pt
+*.pyc
+__pycache__/
+
