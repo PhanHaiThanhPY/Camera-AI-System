@@ -1,0 +1,12 @@
+{
+  "name": "camera-ai-system",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @camera-ai/api --filter @camera-ai/web dev",
+    "build": "pnpm --filter @camera-ai/api build && pnpm --filter @camera-ai/web build",
+    "typecheck": "pnpm --filter @camera-ai/api typecheck && pnpm --filter @camera-ai/web typecheck",
+    "lint": "pnpm --filter @camera-ai/api lint && pnpm --filter @camera-ai/web lint"
+  }
+}

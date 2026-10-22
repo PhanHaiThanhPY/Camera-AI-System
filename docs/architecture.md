@@ -1,0 +1,37 @@
+# Kiến trúc MVP
+
+## Luồng dữ liệu
+
+```text
+Browser
+  POST multipart/form-data
+        ↓
+NestJS VideosController
+  lưu video vào storage/uploads
+  tạo VideoJob
+        ↓ spawn
+Python worker
+  ffprobe metadata
+  ffmpeg snapshot + evidence video
+  YOLO biển số + OCR + tracking, chụp ảnh biển/xe/đá
+        ↓ JSON stdout
+NestJS VideosService
+  cập nhật job
+        ↓ polling
+React + TanStack Query
+```
+
+## Quyết định giai đoạn đầu
+
+- Job và lượt xe lưu trong memory; mất khi restart API.
+- File lưu local để dễ trình diễn tại một máy.
+- HTTP polling được dùng cho trạng thái; WebSocket/queue sẽ thêm sau khi luồng nghiệp vụ ổn định.
+- Worker phát sự kiện `WORKER_EVENT=` trên stderr cho từng xe; API đẩy realtime qua SSE.
+
+## Ranh giới mở rộng
+
+- `VideosService` là nơi thay memory store bằng repository PostgreSQL.
+- `runWorker` là nơi thay process trực tiếp bằng BullMQ worker.
+- `services/ai-worker/worker.py` đã có adapter detector YOLO + RapidOCR; chỉ cần cung cấp model biển số qua `LPR_MODEL_PATH`.
+- URL `/storage` sẽ chuyển sang MinIO/S3 khi triển khai nhiều node.
+
