@@ -342,7 +342,7 @@ export class GatePassesService {
    * Đi qua đúng đường ingestReading như số liệu thật nên có thể thay bằng POST từ trạm cân mà không đổi logic ghép.
    */
   private mockEntryWeigh(pass: GatePass): void {
-    if (process.env.WEIGHBRIDGE_MOCK_RANDOM === "false") {
+    if (process.env.WEIGHBRIDGE_MOCK_RANDOM !== "true") {
       return;
     }
     const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
@@ -351,7 +351,7 @@ export class GatePassesService {
 
   /** Cân giả lập lúc xe ra (đã chở đá lên): gross = tare lúc vào + hàng random, để net luôn hợp lý. */
   private mockExitWeigh(pass: GatePass): void {
-    if (process.env.WEIGHBRIDGE_MOCK_RANDOM === "false") {
+    if (process.env.WEIGHBRIDGE_MOCK_RANDOM !== "true") {
       return;
     }
     const tareKg = pass.weighing?.tareKg ?? randomTareKg();

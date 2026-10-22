@@ -81,11 +81,16 @@ export default function VideoOverlay({ src, passes, videoRef, selectedId }: Vide
       cancelAnimationFrame(frame);
       setTime(video.currentTime);
     };
+    const onMetadata = (): void => {
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        setAspect(video.videoWidth / video.videoHeight);
+      }
+    };
     video.addEventListener("play", start);
     video.addEventListener("pause", stop);
     video.addEventListener("seeked", stop);
     video.addEventListener("ended", stop);
-    video.addEventListener("loadedmetadata", () => video.videoWidth > 0 && setAspect(video.videoWidth / video.videoHeight));
+    video.addEventListener("loadedmetadata", onMetadata);
     if (!video.paused) {
       start();
     }
@@ -95,6 +100,7 @@ export default function VideoOverlay({ src, passes, videoRef, selectedId }: Vide
       video.removeEventListener("pause", stop);
       video.removeEventListener("seeked", stop);
       video.removeEventListener("ended", stop);
+      video.removeEventListener("loadedmetadata", onMetadata);
     };
   }, [videoRef, src]);
 

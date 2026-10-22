@@ -11,9 +11,19 @@ import type { DetectionResult, VideoJob, WorkerResult } from "./video.types";
 const storageRoot = process.env.STORAGE_ROOT ?? join(process.cwd(), "../../storage");
 const resultRoot = join(storageRoot, "results");
 const workerPath = join(__dirname, "../../../../services/ai-worker/worker.py");
-// Ưu tiên .venv ở thư mục gốc repo (có OpenCV) nếu tồn tại; PYTHON_BIN vẫn được ưu tiên cao nhất.
-const venvPython = join(workerPath, "../../../.venv/bin/python");
-const pythonBin = process.env.PYTHON_BIN ?? (existsSync(venvPython) ? venvPython : "python3");
+const repositoryRoot = join(__dirname, "../../../../");
+const pythonCandidates = [
+  join(repositoryRoot, ".venv/bin/python"),
+  join(repositoryRoot, "services/ai-worker/.venv312/bin/python"),
+  join(repositoryRoot, "services/ai-worker/.venv/bin/python")
+];
+const configuredPython = process.env.PYTHON_BIN?.trim();
+const pythonBin = configuredPython || pythonCandidates.find((candidate) => existsSync(candidate)) || "python3";
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function isWorkerResult(value: unknown): value is WorkerResult {
   if (typeof value !== "object" || value === null) {
@@ -29,6 +39,8 @@ export class VideosService implements OnModuleDestroy {
   private readonly logger = new Logger(VideosService.name);
   private readonly jobs = new Map<string, VideoJob>();
   private readonly workers = new Map<string, ChildProcess>();
+  private readonly pendingJobIds: string[] = [];
+  private readonly maxConcurrentJobs = positiveInteger(process.env.MAX_CONCURRENT_VIDEO_JOBS, 1);
   private readonly cancelling = new Set<string>();
   private readonly detectionListeners: ((job: VideoJob, detection: DetectionResult) => void)[] = [];
 
@@ -57,8 +69,9 @@ export class VideosService implements OnModuleDestroy {
       };
 
       this.jobs.set(id, job);
+      this.pendingJobIds.push(id);
       this.logger.log(`video-job queued id=${id} file=${file.originalname} size=${file.size}`);
-      void this.processJob(id, file.path);
+      this.startPendingJobs();
       return job;
     } catch (error: unknown) {
       this.logger.error("Failed to create video job", error instanceof Error ? error.stack : undefined);
@@ -111,6 +124,13 @@ export class VideosService implements OnModuleDestroy {
     const job = this.getJob(id);
     const worker = this.workers.get(id);
     if (worker === undefined) {
+      const pendingIndex = this.pendingJobIds.indexOf(id);
+      if (pendingIndex >= 0 && job.status === VIDEO_STATUS.pending) {
+        this.pendingJobIds.splice(pendingIndex, 1);
+        job.status = VIDEO_STATUS.cancelled;
+        job.updatedAt = new Date().toISOString();
+        return job;
+      }
       throw new ConflictException("Video không còn đang xử lý.");
     }
     this.cancelling.add(id);
@@ -141,6 +161,21 @@ export class VideosService implements OnModuleDestroy {
     }
 
     return job;
+  }
+
+  private startPendingJobs(): void {
+    while (this.workers.size < this.maxConcurrentJobs && this.pendingJobIds.length > 0) {
+      const id = this.pendingJobIds.shift();
+      if (id === undefined) {
+        return;
+      }
+      const job = this.jobs.get(id);
+      if (job === undefined || job.status !== VIDEO_STATUS.pending) {
+        continue;
+      }
+      const inputPath = join(storageRoot, "uploads", basename(job.inputUrl));
+      void this.processJob(id, inputPath);
+    }
   }
 
   private async processJob(id: string, inputPath: string): Promise<void> {
@@ -222,6 +257,7 @@ export class VideosService implements OnModuleDestroy {
       worker.on("error", reject);
       worker.on("close", (code) => {
         this.workers.delete(id);
+        this.startPendingJobs();
         if (code !== 0) {
           reject(new Error(Buffer.concat(stderr).toString("utf8") || `Worker exited with code ${code ?? "unknown"}.`));
           return;

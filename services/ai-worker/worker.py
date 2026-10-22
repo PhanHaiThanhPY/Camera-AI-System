@@ -326,11 +326,11 @@ class Track:
             weights[obs.text] += obs.ocr * obs.det
         return max(weights, key=weights.get) if weights else ""  # type: ignore[arg-type]
 
-    def confirmed(self, min_ocr: float) -> bool:
+    def confirmed(self, min_ocr: float, min_detector: float) -> bool:
         valid = self.valid_observations()
         text = self.vote()
         agreeing = [o for o in valid if o.text == text]
-        return len(agreeing) >= 2 or any(o.ocr >= max(min_ocr, 0.9) for o in agreeing)
+        return len(agreeing) >= 2 or any(o.ocr >= max(min_ocr, 0.9) and o.det >= min_detector for o in agreeing)
 
     def add(self, obs: Observation, frame: Any) -> None:
         self.trail.append(obs)
@@ -365,10 +365,14 @@ class Pipeline:
         material_path = os.getenv("MATERIAL_MODEL_PATH", "")
         self.material_model = YOLO(str(resolve_path(material_path))) if material_path else None
         self.material_zero_shot: MaterialClassifier | None = None
-        if self.material_model is None and os.getenv("MATERIAL_ZERO_SHOT", "true").lower() != "false":
-            self.material_zero_shot = MaterialClassifier()
+        if self.material_model is None and os.getenv("MATERIAL_ZERO_SHOT", "false").lower() == "true":
+            try:
+                self.material_zero_shot = MaterialClassifier()
+            except (ImportError, OSError) as error:
+                print(f"Material classifier unavailable; continuing without it: {error}", file=sys.stderr)
 
         self.confidence = env_float("LPR_CONFIDENCE", 0.3)
+        self.min_detector = env_float("LPR_MIN_DETECTOR_CONF", 0.4)
         self.imgsz = int(env_float("LPR_IMGSZ", 1280))
         self.min_ocr = env_float("LPR_MIN_OCR", 0.5)
         self.timeout = env_float("LPR_TRACK_TIMEOUT", 1.5)
@@ -511,7 +515,7 @@ class Pipeline:
     def finalize(self, track: Track, size: tuple[int, int]) -> None:
         if track in self.active:
             self.active.remove(track)
-        if not track.confirmed(self.min_ocr):
+        if not track.confirmed(self.min_ocr, self.min_detector):
             return
         detection = self.build_detection(track, size, final=True)
         if detection is not None:
@@ -572,7 +576,7 @@ class Pipeline:
                 self.next_id += 1
                 self.active.append(track)
             track.add(obs, frame)
-            if track.emitted == 0 and track.confirmed(self.min_ocr):
+            if track.emitted == 0 and track.confirmed(self.min_ocr, self.min_detector):
                 detection = self.build_detection(track, size, final=False)
                 if detection is not None:
                     self.emit(detection)
