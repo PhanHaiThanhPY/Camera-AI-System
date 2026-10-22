@@ -17,16 +17,21 @@ function optionalText(body: JsonBody, key: string): string | undefined {
   return value;
 }
 
-/** Only explicitly configured local UI origins may request the Telegram token. */
+const PRIVATE_HOST = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/;
+
+/** Chỉ cho trang chạy trên máy/mạng nội bộ đọc token; chặn website bên ngoài gọi chéo vào API local. */
 function assertTrustedOrigin(origin: string | undefined): void {
   if (origin === undefined) {
-    throw new ForbiddenException("Thiếu Origin của giao diện được phép.");
+    return;
   }
-  const allowed = (process.env.CORS_ORIGINS ?? "http://localhost:5173,http://127.0.0.1:5173")
-    .split(",")
-    .map((item) => item.trim())
-    .filter((item) => item !== "");
-  if (!allowed.includes(origin)) {
+  const extra = (process.env.CORS_ORIGINS ?? "").split(",").map((item) => item.trim()).filter((item) => item !== "");
+  let host = "";
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    throw new ForbiddenException("Origin không hợp lệ.");
+  }
+  if (!PRIVATE_HOST.test(host) && !extra.includes(origin)) {
     throw new ForbiddenException("Không được phép xem token từ nguồn này.");
   }
 }

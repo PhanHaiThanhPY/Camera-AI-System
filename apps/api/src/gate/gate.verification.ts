@@ -189,23 +189,16 @@ export function matchScore(
   reading: Pick<WeighReading, "plateNumber" | "measuredAt">,
   windowSeconds: number
 ): number | null {
-  // A reading without a plate must be linked by an operator; time alone is not
-  // enough to identify a vehicle safely.
-  if (reading.plateNumber === null) {
-    return null;
-  }
-
   const gapSeconds = Math.abs(Date.parse(reading.measuredAt) - Date.parse(pass.capture.capturedAt)) / 1000;
   if (!Number.isFinite(gapSeconds) || gapSeconds > windowSeconds) {
     return null;
   }
 
-  const distance = editDistance(normalizePlate(pass.effective.plateNumber), normalizePlate(reading.plateNumber));
-  if (distance > 1) {
-    return null;
+  let plateScore = 0.5;
+  if (reading.plateNumber !== null) {
+    const distance = editDistance(normalizePlate(pass.effective.plateNumber), normalizePlate(reading.plateNumber));
+    plateScore = distance === 0 ? 2 : distance === 1 ? 1 : 0;
   }
-
-  const plateScore = distance === 0 ? 2 : 1;
   return plateScore + (1 - gapSeconds / windowSeconds) * 0.5;
 }
 

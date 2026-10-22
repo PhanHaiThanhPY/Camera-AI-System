@@ -16,9 +16,8 @@ export class JsonStore<T> {
     }
     try {
       return JSON.parse(readFileSync(this.path, "utf8")) as T;
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "unknown read error";
-      throw new Error(`Cannot load JSON store ${this.path}: ${message}`);
+    } catch {
+      return null;
     }
   }
 

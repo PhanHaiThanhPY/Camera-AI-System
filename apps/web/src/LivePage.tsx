@@ -117,35 +117,22 @@ export default function LivePage(): ReactElement {
 
   useEffect(() => {
     let cancelled = false;
-    void request<GatePass[]>("/passes")
-      .then((passes) => {
-        if (!cancelled) {
-          // Gộp với sự kiện đã tới trong lúc tải để không mất dòng nào.
-          setRows((current) => [...current, ...passes.filter((pass) => !current.some((row) => row.id === pass.id))].sort(byTime));
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setMessage(error instanceof Error ? error.message : "Không tải được danh sách lượt xe.");
-        }
-      });
+    void request<GatePass[]>("/passes").then((passes) => {
+      if (!cancelled) {
+        // Gộp với sự kiện đã tới trong lúc tải để không mất dòng nào.
+        setRows((current) => [...current, ...passes.filter((pass) => !current.some((row) => row.id === pass.id))].sort(byTime));
+      }
+    });
     const source = new EventSource(`${API_BASE_URL}/live/events`);
     source.onopen = () => setConnected(true);
     source.onerror = () => setConnected(false);
     source.onmessage = (message: MessageEvent<string>) => {
-      try {
-        const event = JSON.parse(message.data) as GateEvent;
-        if (event.type !== "remove" && event.type !== "upsert") {
-          return;
-        }
-        setRows((current) =>
-          event.type === "remove"
-            ? current.filter((row) => row.id !== event.id)
-            : [event.pass, ...current.filter((row) => row.id !== event.pass.id)].sort(byTime)
-        );
-      } catch (error: unknown) {
-        setMessage(error instanceof Error ? `SSE không hợp lệ: ${error.message}` : "SSE trả về dữ liệu không hợp lệ.");
-      }
+      const event = JSON.parse(message.data) as GateEvent;
+      setRows((current) =>
+        event.type === "remove"
+          ? current.filter((row) => row.id !== event.id)
+          : [event.pass, ...current.filter((row) => row.id !== event.pass.id)].sort(byTime)
+      );
     };
     return () => {
       cancelled = true;
