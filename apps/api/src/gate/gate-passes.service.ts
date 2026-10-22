@@ -8,9 +8,15 @@ import type { DetectionResult, VideoJob } from "../videos/video.types";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { VideosService } from "../videos/videos.service";
 import { findVehicleProfile, isKnownMaterial } from "./gate.catalog";
-import { randomWeights } from "./gate.mock";
+import { JsonStore } from "./json-store";
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { MasterDataService } from "./master-data.service";
+import { NO_MASTER_LINK } from "./master.types";
+import { randomNetKg, randomTareKg } from "./gate.mock";
 import type { AuditEntry, Classification, GateOverrides, GatePass, WeighReading, WeighSummary } from "./gate.types";
 import {
+  computeVisitStatus,
+  deriveReasons,
   deriveStatus,
   matchScore,
   secondWeighScore,
@@ -40,13 +46,20 @@ export interface CaptureRecord {
   id: string;
   plateNumber: string;
   capturedAt: string;
-  source: "video";
+  source: GatePass["capture"]["source"];
   status: GatePass["status"];
+  visitStatus: GatePass["visitStatus"];
   resolution: GatePass["resolution"];
   overviewUrl: string | null;
   plateCropUrl: string | null;
   vehicleImageUrl: string | null;
   loadImageUrl: string | null;
+  /** Ảnh lúc xe ra, null nếu chưa ra hoặc không có camera xác nhận lúc ra. */
+  exitCapturedAt: string | null;
+  exitOverviewUrl: string | null;
+  exitPlateCropUrl: string | null;
+  exitVehicleImageUrl: string | null;
+  exitLoadImageUrl: string | null;
   sizeBytes: number;
 }
 
@@ -65,6 +78,11 @@ function captureUrls(capture: GatePass["capture"]): (string | null)[] {
   return [capture.overviewUrl, capture.plateCropUrl, capture.vehicleImageUrl, capture.loadImageUrl];
 }
 
+/** Ảnh của cả lúc vào lẫn lúc ra (nếu có) — dùng để tính dung lượng và xoá file khi clear một lượt. */
+function allCaptureUrls(pass: Pick<GatePass, "capture" | "exitCapture">): (string | null)[] {
+  return [...captureUrls(pass.capture), ...(pass.exitCapture !== null ? captureUrls(pass.exitCapture) : [])];
+}
+
 function fileSize(url: string | null): number {
   const path = storagePath(url);
   return path !== null && existsSync(path) ? statSync(path).size : 0;
@@ -81,11 +99,39 @@ export class GatePassesService {
   private readonly passes = new Map<string, GatePass>();
   private readonly readings = new Map<string, WeighReading>();
   private readonly passByTrack = new Map<string, string>();
+  /** Các track đại diện cho lượt xe RA (không phải lượt tạo record mới) — ảnh/loại xe/loại đá của track này không ghi đè lên ảnh lúc vào. */
+  private readonly exitTracks = new Set<string>();
+  private readonly store = new JsonStore<{ passes: GatePass[]; readings: WeighReading[]; passByTrack: [string, string][]; exitTracks: string[] }>(
+    join(storageRoot, "gate-state.json")
+  );
   /** Luồng sự kiện cho realtime (SSE). */
   public readonly events = new Subject<GateEvent>();
 
-  public constructor(videosService: VideosService) {
-    videosService.onDetection((job, detection) => this.upsertFromDetection(job, detection));
+  public constructor(
+    private readonly videosService: VideosService,
+    private readonly master: MasterDataService
+  ) {
+    const state = this.store.load();
+    for (const pass of state?.passes ?? []) {
+      // Dữ liệu lưu từ phiên bản trước chưa có lý do/visitStatus; refreshAll bên dưới sẽ tính lại.
+      (pass as Partial<GatePass>).statusReasons ??= [];
+      (pass as Partial<GatePass>).visitStatus ??= null;
+      (pass as Partial<GatePass>).exitCapture ??= null;
+      this.passes.set(pass.id, pass);
+    }
+    for (const reading of state?.readings ?? []) {
+      this.readings.set(reading.id, reading);
+    }
+    for (const [trackKey, passId] of state?.passByTrack ?? []) {
+      this.passByTrack.set(trackKey, passId);
+    }
+    for (const trackKey of state?.exitTracks ?? []) {
+      this.exitTracks.add(trackKey);
+    }
+    // Đối chiếu lại toàn bộ lượt đã lưu với master data hiện tại (và khi master data đổi).
+    this.refreshAll();
+    master.changes.subscribe(() => this.refreshAll());
+    this.videosService.onDetection((job, detection) => this.upsertFromDetection(job, detection));
   }
 
   public listPasses(): GatePass[] {
@@ -102,23 +148,70 @@ export class GatePassesService {
 
   public listCaptures(): { items: CaptureRecord[]; totalBytes: number } {
     const items = this.listPasses().map((pass): CaptureRecord => {
-      const { capture } = pass;
-      const urls = new Set(captureUrls(capture));
+      const { capture, exitCapture } = pass;
+      const urls = new Set(allCaptureUrls(pass));
       return {
         id: pass.id,
         plateNumber: pass.effective.plateNumber,
         capturedAt: capture.capturedAt,
         source: capture.source,
         status: pass.status,
+        visitStatus: pass.visitStatus,
         resolution: pass.resolution,
         overviewUrl: capture.overviewUrl,
         plateCropUrl: capture.plateCropUrl,
         vehicleImageUrl: capture.vehicleImageUrl,
         loadImageUrl: capture.loadImageUrl,
+        exitCapturedAt: exitCapture?.capturedAt ?? null,
+        exitOverviewUrl: exitCapture?.overviewUrl ?? null,
+        exitPlateCropUrl: exitCapture?.plateCropUrl ?? null,
+        exitVehicleImageUrl: exitCapture?.vehicleImageUrl ?? null,
+        exitLoadImageUrl: exitCapture?.loadImageUrl ?? null,
         sizeBytes: [...urls].reduce((total, url) => total + fileSize(url), 0)
       };
     });
     return { items, totalBytes: items.reduce((total, item) => total + item.sizeBytes, 0) };
+  }
+
+  /** Chạy lại phân loại loại đá trên ảnh vùng hàng đã lưu (cho các lượt chụp trước khi có bộ phân loại). */
+  public async reclassifyMaterials(): Promise<{ checked: number; classified: number; removedNotCargo: number }> {
+    const targets = [...this.passes.values()].filter((pass) => pass.capture.loadImageUrl !== null && pass.material.code === null && pass.overrides.material === undefined);
+    const files = new Map<string, GatePass>();
+    for (const pass of targets) {
+      const path = storagePath(pass.capture.loadImageUrl);
+      if (path !== null && existsSync(path)) {
+        files.set(path, pass);
+      }
+    }
+    if (files.size === 0) {
+      return { checked: 0, classified: 0, removedNotCargo: 0 };
+    }
+
+    const output = await this.videosService.runWorkerCli(["classify-material", ...files.keys()]);
+    const results = JSON.parse(output.trim().split("\n").pop() ?? "{}") as Record<
+      string,
+      { code: string | null; confidence: number | null; source: Classification["source"]; notCargo: boolean }
+    >;
+    let classified = 0;
+    let removedNotCargo = 0;
+    for (const [path, pass] of files) {
+      const verdict = results[path];
+      if (verdict === undefined || pass.resolution !== "PENDING") {
+        continue;
+      }
+      if (verdict.notCargo) {
+        unlinkSync(path);
+        pass.capture.loadImageUrl = null;
+        pass.capture.loadBox = null;
+        removedNotCargo += 1;
+      } else if (verdict.code !== null) {
+        pass.material = { code: verdict.code, confidence: verdict.confidence, source: verdict.source };
+        classified += 1;
+      }
+      this.refresh(pass);
+      this.events.next({ type: "upsert", pass });
+    }
+    return { checked: files.size, classified, removedNotCargo };
   }
 
   /** Xoá bản ghi và ảnh của lượt xe; không đụng tới video gốc. Trả về số lượt và số byte đã giải phóng. */
@@ -131,6 +224,7 @@ export class GatePassesService {
     if (scope === "all") {
       this.readings.clear();
     }
+    this.persist();
     this.logger.log(`gate-clear scope=${scope} removed=${targets.length} freedBytes=${freedBytes}`);
     return { removed: targets.length, freedBytes };
   }
@@ -141,7 +235,7 @@ export class GatePassesService {
 
   private deletePass(pass: GatePass): number {
     let freed = 0;
-    for (const url of new Set(captureUrls(pass.capture))) {
+    for (const url of new Set(allCaptureUrls(pass))) {
       const path = storagePath(url);
       if (path !== null && existsSync(path)) {
         freed += statSync(path).size;
@@ -155,9 +249,11 @@ export class GatePassesService {
     for (const [trackKey, passId] of this.passByTrack) {
       if (passId === pass.id) {
         this.passByTrack.delete(trackKey);
+        this.exitTracks.delete(trackKey);
       }
     }
     this.events.next({ type: "remove", id: pass.id });
+    this.persist();
     return freed;
   }
 
@@ -166,8 +262,11 @@ export class GatePassesService {
   }
 
   /**
-   * Nhận biển số từ worker (realtime). Lần đầu một xe được xác nhận thì tạo lượt xe và cân giả lập;
-   * các lần sau (khi worker chốt frame/biển số tốt nhất) chỉ cập nhật ảnh và kết quả.
+   * Nhận biển số từ worker (realtime). Một track mới (biển số chưa gặp trong video này) được coi là một lượt
+   * camera nhìn thấy xe — kiểm tra biển này có lượt nào đang mở (đã vào, chưa ra) không:
+   *   - Có: đây là lượt xe RA, ghép tiếp vào đúng record cũ (một record giữ cả vào lẫn ra, có cả 2 bộ ảnh).
+   *   - Không (lần đầu, hoặc lượt trước đã vào/ra xong rồi): đây là lượt xe VÀO, tạo record mới.
+   * Các lần sau cùng track (worker chốt frame/biển số tốt hơn) chỉ cập nhật ảnh (đúng phía vào/ra) của record đó.
    */
   public upsertFromDetection(job: VideoJob, detection: DetectionResult): GatePass {
     const trackKey = `${job.id}:${detection.trackId ?? detection.plateNumber}`;
@@ -175,13 +274,33 @@ export class GatePassesService {
     const existing = existingId === undefined ? undefined : this.passes.get(existingId);
 
     if (existing === undefined) {
+      const openPass = this.findOpenPassByPlate(normalizePlate(detection.plateNumber));
+      if (openPass !== undefined) {
+        this.passByTrack.set(trackKey, openPass.id);
+        this.exitTracks.add(trackKey);
+        openPass.exitCapture = this.captureFromDetection(job, detection, new Date().toISOString());
+        this.mockExitWeigh(openPass);
+        this.pushAudit(openPass, "system", "exit_sighting", null, null, { trackKey, plate: detection.plateNumber });
+        this.refresh(openPass);
+        this.events.next({ type: "upsert", pass: openPass });
+        return openPass;
+      }
       const capture = this.captureFromDetection(job, detection, new Date().toISOString());
       const pass = this.registerPass(capture, detection.vehicleType ?? UNAVAILABLE, detection.material ?? UNAVAILABLE);
       this.passByTrack.set(trackKey, pass.id);
-      this.mockWeigh(pass);
+      this.mockEntryWeigh(pass);
       return pass;
     }
     if (existing.resolution !== "PENDING") {
+      return existing;
+    }
+    if (this.exitTracks.has(trackKey)) {
+      // Track của lượt RA: refine ảnh lúc ra (giữ nguyên thời điểm chụp lúc ra ban đầu), không đụng ảnh lúc vào.
+      existing.exitCapture = this.captureFromDetection(job, detection, existing.exitCapture?.capturedAt ?? new Date().toISOString());
+      if (detection.final === true) {
+        this.pushAudit(existing, "system", "exit_capture_final", null, null, { plate: existing.exitCapture.plateText, evidenceSeconds: existing.exitCapture.mediaTimeSec });
+      }
+      this.events.next({ type: "upsert", pass: existing });
       return existing;
     }
 
@@ -201,21 +320,50 @@ export class GatePassesService {
     return existing;
   }
 
+  /** Lượt đang mở (đã vào, chưa ra, chưa bị từ chối/xác nhận) gần nhất của một biển số, nếu có. */
+  private findOpenPassByPlate(plateNormalized: string): GatePass | undefined {
+    let best: GatePass | undefined;
+    for (const pass of this.passes.values()) {
+      if (pass.resolution !== "PENDING" || pass.visitStatus === "EXITED") {
+        continue;
+      }
+      if (normalizePlate(pass.effective.plateNumber) !== plateNormalized) {
+        continue;
+      }
+      if (best === undefined || pass.capture.capturedAt > best.capture.capturedAt) {
+        best = pass;
+      }
+    }
+    return best;
+  }
+
   /**
-   * Cân giả lập: mỗi lần chụp được biển số thì random cân tại thời điểm đó (hard code, chưa có trạm cân thật).
+   * Cân giả lập lúc xe vào (xe trống): hard code, chưa có trạm cân thật, tắt bằng WEIGHBRIDGE_MOCK_RANDOM=false.
    * Đi qua đúng đường ingestReading như số liệu thật nên có thể thay bằng POST từ trạm cân mà không đổi logic ghép.
    */
-  private mockWeigh(pass: GatePass): void {
+  private mockEntryWeigh(pass: GatePass): void {
     if (process.env.WEIGHBRIDGE_MOCK_RANDOM === "false") {
       return;
     }
-    const { tareKg, grossKg } = randomWeights();
     const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
-    this.ingestReading({ ...base, grossKg, tareKg: null, measuredAt: new Date(Date.parse(pass.capture.capturedAt) + 20_000).toISOString() }, "mock");
-    this.ingestReading({ ...base, grossKg: null, tareKg, measuredAt: new Date().toISOString() }, "mock");
+    this.ingestReading({ ...base, grossKg: null, tareKg: randomTareKg(), measuredAt: new Date().toISOString() }, "mock");
   }
 
-  /** Điểm vào của hệ thống cân ngoài. Tự ghép với lượt xe chưa có số liệu cân gần nhất. */
+  /** Cân giả lập lúc xe ra (đã chở đá lên): gross = tare lúc vào + hàng random, để net luôn hợp lý. */
+  private mockExitWeigh(pass: GatePass): void {
+    if (process.env.WEIGHBRIDGE_MOCK_RANDOM === "false") {
+      return;
+    }
+    const tareKg = pass.weighing?.tareKg ?? randomTareKg();
+    const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
+    this.ingestReading({ ...base, grossKg: tareKg + randomNetKg(), tareKg: null, measuredAt: new Date().toISOString() }, "mock");
+  }
+
+  /**
+   * Điểm vào của hệ thống cân ngoài. Tự ghép với lượt xe đang chờ (đã vào, chưa ra) gần nhất theo biển số.
+   * Không có lượt nào đang chờ (xe mới tới lần đầu, hoặc lượt trước của xe này đã vào/ra xong rồi) thì tạo
+   * một lượt mới và coi số liệu này là cân đầu vào của lượt mới — đúng yêu cầu "đã vào đã ra rồi, cân tiếp thì tạo record mới".
+   */
   public ingestReading(input: ReadingInput, source: WeighReading["source"] = "external"): WeighReading {
     const reading: WeighReading = {
       id: randomUUID(),
@@ -225,8 +373,9 @@ export class GatePassesService {
       gatePassId: null
     };
     this.readings.set(reading.id, reading);
+    this.persist();
 
-    // Lần cân thứ hai của lượt xe đã có một lần cân: ghép theo biển số.
+    // Lần cân thứ hai của lượt xe đã có một lần cân (đã vào, chưa ra): ghép theo biển số.
     let best: { pass: GatePass; score: number } | null = null;
     for (const pass of this.passes.values()) {
       if (pass.resolution !== "PENDING") {
@@ -241,10 +390,13 @@ export class GatePassesService {
       }
     }
 
-    if (best === null) {
-      this.logger.warn(`weigh-reading unmatched id=${reading.id} ticket=${reading.ticketNo ?? "-"}`);
-    } else {
+    if (best !== null) {
       this.attachReading(best.pass, reading, "system", null);
+    } else if (reading.plateNumber !== null && normalizePlate(reading.plateNumber).length >= 4) {
+      // Không có lượt nào đang mở cho biển này (chưa từng vào, hoặc lượt trước đã vào/ra xong) → lượt mới.
+      this.createFromReading(reading);
+    } else {
+      this.logger.warn(`weigh-reading unmatched id=${reading.id} ticket=${reading.ticketNo ?? "-"}`);
     }
     return reading;
   }
@@ -332,23 +484,64 @@ export class GatePassesService {
     };
   }
 
+  /** Lượt không có ảnh camera, tạo thẳng từ một số liệu cân (xem ingestReading). */
+  private captureFromReading(reading: WeighReading): GatePass["capture"] {
+    const plateText = reading.plateNumber ?? "";
+    return {
+      source: "weighbridge",
+      videoJobId: null,
+      cameraId: reading.scaleId,
+      clockSource: "server",
+      capturedAt: reading.measuredAt,
+      mediaTimeSec: null,
+      overviewUrl: null,
+      plateCropUrl: null,
+      vehicleImageUrl: null,
+      loadImageUrl: null,
+      vehicleBox: null,
+      loadBox: null,
+      trackId: `wb-${reading.id}`,
+      trail: [],
+      plateText,
+      plateNormalized: normalizePlate(plateText),
+      ocrConfidence: null,
+      detectorConfidence: null,
+      plateRegion: null
+    };
+  }
+
+  /** Tạo lượt mới (cân đầu vào) từ một số liệu cân chưa ghép được với lượt nào đang mở. */
+  private createFromReading(reading: WeighReading): GatePass {
+    const capture = this.captureFromReading(reading);
+    // autoMatchReadings=false: ta sẽ gắn đúng reading này ngay sau đây, không để registerPass tự dò reading khác.
+    const pass = this.registerPass(capture, UNAVAILABLE, UNAVAILABLE, undefined, false);
+    this.attachReading(pass, reading, "system", null);
+    this.logger.log(`weigh-reading created new pass id=${pass.id} plate=${capture.plateText || "?"} (không có ảnh camera)`);
+    return pass;
+  }
+
   private registerPass(
     capture: GatePass["capture"],
     vehicleType: Classification,
     material: Classification,
-    id: string = randomUUID()
+    id: string = randomUUID(),
+    autoMatchReadings = true
   ): GatePass {
     const now = new Date().toISOString();
     const pass: GatePass = {
+      master: NO_MASTER_LINK,
       id,
       createdAt: now,
       updatedAt: now,
       capture,
+      exitCapture: null,
       vehicleType,
       material,
       weighing: null,
       checks: [],
       status: "WAITING_WEIGHT",
+      statusReasons: [],
+      visitStatus: null,
       resolution: "PENDING",
       overrides: {},
       effective: { plateNumber: capture.plateText, vehicleType: vehicleType.code, material: material.code },
@@ -358,11 +551,13 @@ export class GatePassesService {
     this.pushAudit(pass, "system", "capture", null, null, { plate: capture.plateText, source: capture.source });
     this.passes.set(id, pass);
 
-    // Phiếu cân có thể đến trước khi camera xử lý xong.
-    for (const reading of this.readings.values()) {
-      if (reading.gatePassId === null && matchScore(pass, reading, this.config.matchWindowSeconds) !== null) {
-        this.attachReading(pass, reading, "system", null);
-        break;
+    if (autoMatchReadings) {
+      // Phiếu cân có thể đến trước khi camera xử lý xong.
+      for (const reading of this.readings.values()) {
+        if (reading.gatePassId === null && matchScore(pass, reading, this.config.matchWindowSeconds) !== null) {
+          this.attachReading(pass, reading, "system", null);
+          break;
+        }
       }
     }
     this.events.next({ type: "upsert", pass });
@@ -406,15 +601,39 @@ export class GatePassesService {
     this.events.next({ type: "upsert", pass });
   }
 
+  private refreshAll(): void {
+    const fingerprint = (pass: GatePass): string => `${pass.status}|${pass.statusReasons.join()}|${pass.visitStatus}|${JSON.stringify(pass.master)}`;
+    for (const pass of this.passes.values()) {
+      const before = fingerprint(pass);
+      this.refresh(pass);
+      if (before !== fingerprint(pass)) {
+        this.events.next({ type: "upsert", pass });
+      }
+    }
+  }
+
+  private persist(): void {
+    this.store.save(() => ({
+      passes: [...this.passes.values()],
+      readings: [...this.readings.values()],
+      passByTrack: [...this.passByTrack.entries()],
+      exitTracks: [...this.exitTracks]
+    }));
+  }
+
   private refresh(pass: GatePass): void {
     pass.effective = {
       plateNumber: pass.overrides.plateNumber ?? pass.capture.plateText,
       vehicleType: pass.overrides.vehicleType ?? pass.vehicleType.code,
       material: pass.overrides.material ?? pass.material.code
     };
+    pass.master = this.master.lookup(pass.effective.plateNumber);
     pass.checks = runChecks(pass, this.config);
-    pass.status = deriveStatus(pass.checks, pass.weighing);
+    pass.status = deriveStatus(pass.checks, pass.weighing, pass.master);
+    pass.statusReasons = deriveReasons(pass.status, pass.checks);
+    pass.visitStatus = computeVisitStatus(pass.weighing);
     pass.updatedAt = new Date().toISOString();
+    this.persist();
   }
 
   private pushAudit(

@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Controller,
   Get,
+  HttpCode,
   Param,
   Post,
   UploadedFile,
@@ -62,6 +63,12 @@ export class VideosController {
   @Get(":id")
   public get(@Param("id") id: string): VideoJob {
     return this.videosService.getJob(id);
+  }
+
+  @Post(":id/cancel")
+  @HttpCode(200)
+  public cancel(@Param("id") id: string): VideoJob {
+    return this.videosService.cancelJob(id);
   }
 
   @Get(":id/result")

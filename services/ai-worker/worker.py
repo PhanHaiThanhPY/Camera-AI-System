@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from collections import defaultdict
@@ -25,6 +26,14 @@ PLATE_PATTERN = re.compile(os.getenv("LPR_PLATE_REGEX", r"^\d{2}[A-Z]{1,2}\d{4,6
 VEHICLE_CLASSES = {"car": "car", "motorcycle": "motorcycle", "bus": "bus", "truck": "truck"}
 
 Box = tuple[int, int, int, int]
+
+# SIGTERM từ API (nút Dừng): thoát vòng đọc frame, chốt các xe đang theo dõi rồi trả kết quả.
+STOP_REQUESTED = False
+
+
+def request_stop(_signum: int, _frame: Any) -> None:
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
 
 
 def env_float(name: str, default: float) -> float:
@@ -228,6 +237,51 @@ def normalize_box(box: Box, frame_size: tuple[int, int], source: str) -> dict[st
     return {"box": [round(box[0] / width, 5), round(box[1] / height, 5), round(box[2] / width, 5), round(box[3] / height, 5)], "source": source}
 
 
+# --- Phân loại loại đá (zero-shot) -----------------------------------------------------------
+
+# Mô tả để CLIP so khớp với ảnh vùng hàng. Mã trùng danh mục trong gate.catalog.ts; "not_cargo" = không phải thùng hàng.
+MATERIAL_PROMPTS = {
+    "da_bi": "a dump truck bed full of small round gravel stones",
+    "da_vuong": "a dump truck bed full of large angular rock blocks",
+    "empty": "an empty truck bed with no cargo",
+    "not_cargo": "the front of a passenger car",
+}
+
+
+class MaterialClassifier:
+    """Phân loại loại đá bằng CLIP zero-shot khi chưa có model huấn luyện riêng.
+
+    Chỉ là ước lượng theo hình dạng/kích cỡ hạt đá; độ tin cậy dưới MATERIAL_MIN_CONF thì trả "chưa xác định".
+    Thay bằng model huấn luyện trên ảnh của mỏ (MATERIAL_MODEL_PATH) để chính xác hơn.
+    """
+
+    def __init__(self) -> None:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+
+        name = os.getenv("MATERIAL_CLIP_MODEL", "openai/clip-vit-base-patch32")
+        self.torch = torch
+        self.model = CLIPModel.from_pretrained(name).eval()
+        self.processor = CLIPProcessor.from_pretrained(name)
+        self.min_conf = env_float("MATERIAL_MIN_CONF", 0.5)
+
+    def classify(self, bgr_image: Any) -> dict[str, Any]:
+        from PIL import Image
+
+        image = Image.fromarray(bgr_image[:, :, ::-1])
+        inputs = self.processor(text=list(MATERIAL_PROMPTS.values()), images=image, return_tensors="pt", padding=True)
+        with self.torch.no_grad():
+            probs = self.model(**inputs).logits_per_image.softmax(-1)[0].tolist()
+        scores = dict(zip(MATERIAL_PROMPTS, probs))
+        code = max(scores, key=scores.get)  # type: ignore[arg-type]
+        confidence = round(float(scores[code]), 4)
+        if code == "not_cargo":
+            return {"code": None, "confidence": confidence, "source": "unavailable", "notCargo": confidence >= 0.8}
+        if confidence < self.min_conf:
+            return {"code": None, "confidence": confidence, "source": "unavailable", "notCargo": False}
+        return {"code": code, "confidence": confidence, "source": "zero-shot", "notCargo": False}
+
+
 # --- Track -----------------------------------------------------------------------------------
 
 
@@ -310,6 +364,9 @@ class Pipeline:
         self.vehicle_detector = YOLO(str(vehicle_model)) if vehicle_model.exists() else None
         material_path = os.getenv("MATERIAL_MODEL_PATH", "")
         self.material_model = YOLO(str(resolve_path(material_path))) if material_path else None
+        self.material_zero_shot: MaterialClassifier | None = None
+        if self.material_model is None and os.getenv("MATERIAL_ZERO_SHOT", "true").lower() != "false":
+            self.material_zero_shot = MaterialClassifier()
 
         self.confidence = env_float("LPR_CONFIDENCE", 0.3)
         self.imgsz = int(env_float("LPR_IMGSZ", 1280))
@@ -390,11 +447,22 @@ class Pipeline:
             urls[name] = f"{prefix}/{file_name}?v={version}"
 
         material: dict[str, Any] = {"code": None, "confidence": None, "source": "unavailable"}
-        if load_box is not None and self.material_model is not None:
+        if load_box is not None:
             load_crop = frame[load_box[1] : load_box[3], load_box[0] : load_box[2]]
-            result = self.material_model(load_crop, verbose=False)[0]
-            if getattr(result, "probs", None) is not None:
-                material = {"code": str(result.names[int(result.probs.top1)]), "confidence": round(float(result.probs.top1conf), 4), "source": "model"}
+            if self.material_model is not None:
+                result = self.material_model(load_crop, verbose=False)[0]
+                if getattr(result, "probs", None) is not None:
+                    material = {"code": str(result.names[int(result.probs.top1)]), "confidence": round(float(result.probs.top1conf), 4), "source": "model"}
+            elif self.material_zero_shot is not None and load_crop.size > 0:
+                verdict = self.material_zero_shot.classify(load_crop)
+                if verdict["notCargo"]:
+                    # Model xe nhận nhầm (ví dụ xe con): không có thùng hàng nên bỏ ảnh đá.
+                    (self.job_dir / f"load-{key}.jpg").unlink(missing_ok=True)
+                    urls["load"] = None
+                    crops.pop("load", None)
+                    load_box = None
+                else:
+                    material = {k: verdict[k] for k in ("code", "confidence", "source")}
 
         overview = frame.copy()
         for name, color in (("vehicle", (0, 215, 255)), ("load", (0, 140, 255))):
@@ -465,7 +533,7 @@ class Pipeline:
         frame_index = 0
 
         try:
-            while True:
+            while not STOP_REQUESTED:
                 if not capture.grab():
                     break
                 if frame_index % step == 0:
@@ -510,7 +578,22 @@ class Pipeline:
                     self.emit(detection)
 
 
+def classify_material_cli(paths: list[str]) -> None:
+    """Phân loại lại loại đá cho các ảnh vùng hàng đã lưu: in JSON {đường dẫn: kết quả}."""
+    import cv2
+
+    classifier = MaterialClassifier()
+    results: dict[str, Any] = {}
+    for path in paths:
+        image = cv2.imread(path)
+        results[path] = classifier.classify(image) if image is not None else {"code": None, "confidence": None, "source": "unavailable", "notCargo": False}
+    print(json.dumps(results))
+
+
 def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "classify-material":
+        classify_material_cli(sys.argv[2:])
+        return
     if len(sys.argv) != 4:
         raise ValueError("Usage: worker.py <input_path> <result_root> <job_id>")
     input_path = Path(sys.argv[1]).resolve()
@@ -528,6 +611,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, request_stop)
     try:
         main()
     except Exception as error:  # noqa: BLE001

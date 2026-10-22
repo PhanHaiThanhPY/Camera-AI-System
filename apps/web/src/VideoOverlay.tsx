@@ -19,9 +19,8 @@ interface Box {
 
 const MAX_GAP_SECONDS = 1.2;
 
-/** Vị trí biển số của một xe tại thời điểm t: nội suy giữa hai mẫu gần nhất, ngoài vùng theo dõi thì không vẽ. */
-function boxAt(pass: GatePass, time: number): Box | null {
-  const { trail, plateText } = pass.capture;
+/** Nội suy một trail tại thời điểm t; null nếu t ngoài vùng track đó. */
+function sampleTrail(trail: [number, number, number, number, number][], time: number): [number, number, number, number] | null {
   if (trail.length === 0 || time < trail[0]![0] - 0.4 || time > trail[trail.length - 1]![0] + 0.4) {
     return null;
   }
@@ -38,7 +37,25 @@ function boxAt(pass: GatePass, time: number): Box | null {
   const span = after[0] - before[0];
   const ratio = span > 0 && span <= MAX_GAP_SECONDS ? Math.min(Math.max((time - before[0]) / span, 0), 1) : 0;
   const lerp = (a: number, b: number): number => a + (b - a) * ratio;
-  return { id: pass.id, label: plateText, x1: lerp(before[1], after[1]), y1: lerp(before[2], after[2]), x2: lerp(before[3], after[3]), y2: lerp(before[4], after[4]) };
+  return [lerp(before[1], after[1]), lerp(before[2], after[2]), lerp(before[3], after[3]), lerp(before[4], after[4])];
+}
+
+/**
+ * Vị trí biển số của một xe tại thời điểm t. Một lượt xe có hai track rời nhau trong cùng video (lúc vào,
+ * lúc ra) nên thử cả hai, không chỉ track lúc vào.
+ */
+function boxAt(pass: GatePass, time: number): Box | null {
+  const entry = sampleTrail(pass.capture.trail, time);
+  if (entry !== null) {
+    return { id: pass.id, label: pass.capture.plateText, x1: entry[0], y1: entry[1], x2: entry[2], y2: entry[3] };
+  }
+  if (pass.exitCapture !== null) {
+    const exit = sampleTrail(pass.exitCapture.trail, time);
+    if (exit !== null) {
+      return { id: pass.id, label: pass.exitCapture.plateText, x1: exit[0], y1: exit[1], x2: exit[2], y2: exit[3] };
+    }
+  }
+  return null;
 }
 
 /** Video gốc kèm khung khoanh vùng biển số đồng bộ theo thời gian phát. */

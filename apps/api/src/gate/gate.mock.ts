@@ -6,12 +6,14 @@ function randomStep(minKg: number, maxKg: number): number {
 }
 
 /**
- * Cân nặng giả lập, random mỗi lần gọi (mỗi lần chụp được biển số).
- * Tare (xe không) 1,0–1,5 tấn, hàng 0,6–1,5 tấn, làm tròn 100 kg (ví dụ 1 tấn 1, 1 tấn 2).
- * Tắt bằng WEIGHBRIDGE_MOCK_RANDOM=false khi đã nối trạm cân thật.
+ * Cân nặng giả lập, random mỗi lần gọi (hard code, chưa có trạm cân thật — tắt bằng WEIGHBRIDGE_MOCK_RANDOM=false).
+ * Tare (xe không, lúc vào) 1,0–1,5 tấn; hàng (đá chở ra) 0,6–1,5 tấn, làm tròn 100 kg (ví dụ 1 tấn 1, 1 tấn 2).
+ * Gross (lúc ra) = tare + hàng.
  */
-export function randomWeights(): { tareKg: number; netKg: number; grossKg: number } {
-  const tareKg = randomStep(1000, 1500);
-  const netKg = randomStep(600, 1500);
-  return { tareKg, netKg, grossKg: tareKg + netKg };
+export function randomTareKg(): number {
+  return randomStep(1000, 1500);
+}
+
+export function randomNetKg(): number {
+  return randomStep(600, 1500);
 }

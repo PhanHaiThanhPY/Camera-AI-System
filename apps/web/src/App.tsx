@@ -1,12 +1,16 @@
 import { ReactElement, useEffect, useState } from "react";
 import CapturesTable from "./CapturesTable";
 import LivePage from "./LivePage";
+import MasterPage from "./MasterPage";
+import TelegramPage from "./TelegramPage";
 
-type View = "live" | "table";
+type View = "live" | "table" | "master" | "telegram";
+const VIEWS: View[] = ["live", "table", "master", "telegram"];
 
 /** Route theo hash (#/live, #/table) nên chạy được trên mọi static host. */
 function readView(): View {
-  return window.location.hash.replace(/^#\/?/, "") === "table" ? "table" : "live";
+  const name = window.location.hash.replace(/^#\/?/, "");
+  return VIEWS.find((view) => view === name) ?? "live";
 }
 
 function App(): ReactElement {
@@ -30,8 +34,13 @@ function App(): ReactElement {
       <nav className="view-tabs" aria-label="Menu">
         <button aria-pressed={view === "live"} type="button" onClick={() => { window.location.hash = "/live"; }}>Realtime</button>
         <button aria-pressed={view === "table"} type="button" onClick={() => { window.location.hash = "/table"; }}>Danh sách ảnh đã chụp</button>
+        <button aria-pressed={view === "master"} type="button" onClick={() => { window.location.hash = "/master"; }}>Master data</button>
+        <button aria-pressed={view === "telegram"} type="button" onClick={() => { window.location.hash = "/telegram"; }}>Telegram</button>
       </nav>
-      {view === "live" ? <LivePage /> : <CapturesTable />}
+      {view === "live" && <LivePage />}
+      {view === "table" && <CapturesTable />}
+      {view === "master" && <MasterPage />}
+      {view === "telegram" && <TelegramPage />}
     </main>
   );
 }

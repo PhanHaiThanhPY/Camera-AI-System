@@ -9,4 +9,4 @@ Chạy `scripts/download-models.sh` để tải:
 
 Không commit file `.pt`. Đường dẫn đổi qua `LPR_MODEL_PATH`, `VEHICLE_DET_MODEL_PATH`.
 
-Loại đá: chưa có model. Đặt `MATERIAL_MODEL_PATH` trỏ tới model phân loại ảnh (YOLO classify) có tên class trùng mã danh mục (`da_bi`, `da_vuong`, `empty`). Khi chưa có, loại đá để "chưa xác định" cho người vận hành chọn.
+Loại đá: chưa có model huấn luyện riêng nên worker dùng CLIP zero-shot (`openai/clip-vit-base-patch32`, tải tự động lần đầu) để ước lượng đá bi / đá vuông / không chở hàng từ ảnh vùng hàng. Đây chỉ là ước lượng theo hình dạng và kích cỡ hạt đá; độ tin cậy dưới `MATERIAL_MIN_CONF` (0,5) thì để "chưa xác định". Nếu ảnh vùng hàng thực ra là xe con (model xe nhận nhầm), ảnh bị bỏ. Tắt bằng `MATERIAL_ZERO_SHOT=false`. Khi có model huấn luyện trên ảnh của mỏ: đặt `MATERIAL_MODEL_PATH` (YOLO classify, tên class trùng `da_bi`, `da_vuong`, `empty`), model này được ưu tiên.

@@ -1,5 +1,7 @@
-import { Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { ConflictException, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import type { OnModuleDestroy } from "@nestjs/common";
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, basename, relative } from "node:path";
@@ -23,9 +25,11 @@ function isWorkerResult(value: unknown): value is WorkerResult {
 }
 
 @Injectable()
-export class VideosService {
+export class VideosService implements OnModuleDestroy {
   private readonly logger = new Logger(VideosService.name);
   private readonly jobs = new Map<string, VideoJob>();
+  private readonly workers = new Map<string, ChildProcess>();
+  private readonly cancelling = new Set<string>();
   private readonly detectionListeners: ((job: VideoJob, detection: DetectionResult) => void)[] = [];
 
   public constructor() {
@@ -84,6 +88,48 @@ export class VideosService {
     }
   }
 
+  /** Chạy một lệnh phụ của worker (ví dụ classify-material) và trả stdout. */
+  public runWorkerCli(args: string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const worker = spawn(pythonBin, [workerPath, ...args], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      worker.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+      worker.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      worker.on("error", reject);
+      worker.on("close", (code) =>
+        code === 0 ? resolve(Buffer.concat(stdout).toString("utf8")) : reject(new Error(Buffer.concat(stderr).toString("utf8") || `Worker exited with code ${code ?? "unknown"}.`))
+      );
+    });
+  }
+
+  /**
+   * Nút Dừng: báo worker dừng êm (chốt các xe đang theo dõi rồi thoát) để giữ kết quả đã nhận diện;
+   * quá 10 giây chưa thoát thì buộc dừng.
+   */
+  public cancelJob(id: string): VideoJob {
+    const job = this.getJob(id);
+    const worker = this.workers.get(id);
+    if (worker === undefined) {
+      throw new ConflictException("Video không còn đang xử lý.");
+    }
+    this.cancelling.add(id);
+    worker.kill("SIGTERM");
+    setTimeout(() => {
+      if (this.workers.get(id) === worker) {
+        worker.kill("SIGKILL");
+      }
+    }, 10_000).unref();
+    this.logger.log(`video-job cancel requested id=${id}`);
+    return job;
+  }
+
+  public onModuleDestroy(): void {
+    for (const worker of this.workers.values()) {
+      worker.kill("SIGKILL");
+    }
+  }
+
   public listJobs(): VideoJob[] {
     return [...this.jobs.values()].sort((first, second) => second.createdAt.localeCompare(first.createdAt));
   }
@@ -107,8 +153,8 @@ export class VideosService {
 
     try {
       const workerResult = await this.runWorker(id, inputPath);
-      job.status = VIDEO_STATUS.completed;
-      job.progress = 100;
+      job.status = this.cancelling.delete(id) ? VIDEO_STATUS.cancelled : VIDEO_STATUS.completed;
+      job.progress = job.status === VIDEO_STATUS.cancelled ? job.progress : 100;
       job.updatedAt = new Date().toISOString();
       job.metadata = {
         durationSeconds: workerResult.durationSeconds,
@@ -125,6 +171,13 @@ export class VideosService {
         `video-job completed id=${id} detections=${job.detections.length} durationMs=${Date.now() - startedAt}`
       );
     } catch (error: unknown) {
+      if (this.cancelling.delete(id)) {
+        // Bị buộc dừng trước khi worker kịp trả kết quả: giữ các xe đã nhận diện.
+        job.status = VIDEO_STATUS.cancelled;
+        job.updatedAt = new Date().toISOString();
+        this.logger.log(`video-job cancelled (forced) id=${id} detections=${job.detections.length}`);
+        return;
+      }
       const message = error instanceof Error ? error.message : "Worker xử lý video thất bại.";
       job.status = VIDEO_STATUS.failed;
       job.progress = 100;
@@ -142,6 +195,7 @@ export class VideosService {
       });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
+      this.workers.set(id, worker);
 
       worker.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       let pending = "";
@@ -167,6 +221,7 @@ export class VideosService {
       });
       worker.on("error", reject);
       worker.on("close", (code) => {
+        this.workers.delete(id);
         if (code !== 0) {
           reject(new Error(Buffer.concat(stderr).toString("utf8") || `Worker exited with code ${code ?? "unknown"}.`));
           return;

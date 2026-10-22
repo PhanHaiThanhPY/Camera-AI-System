@@ -1,5 +1,6 @@
 import { EMPTY_MATERIAL, findVehicleProfile, isKnownMaterial } from "./gate.catalog";
-import type { GatePass, VerificationCheck, VerificationStatus, WeighReading, WeighSummary } from "./gate.types";
+import type { MasterLink } from "./master.types";
+import type { GatePass, VerificationCheck, VerificationStatus, VisitStatus, WeighReading, WeighSummary } from "./gate.types";
 
 export interface VerificationConfig {
   matchWindowSeconds: number;
@@ -46,11 +47,19 @@ function check(code: string, label: string, result: VerificationCheck["result"],
 
 /** Chạy toàn bộ kiểm tra chéo camera ↔ cân. Hàm thuần: cùng đầu vào cho cùng kết quả. */
 export function runChecks(
-  pass: Pick<GatePass, "capture" | "effective" | "weighing">,
+  pass: Pick<GatePass, "capture" | "effective" | "weighing" | "master">,
   config: VerificationConfig
 ): VerificationCheck[] {
-  const { capture, effective, weighing } = pass;
+  const { capture, effective, weighing, master } = pass;
   const checks: VerificationCheck[] = [];
+
+  if (master.match === "exact") {
+    checks.push(check("YARD_VEHICLE", "Xe có trong bãi (master data)", "pass", `Xe ${master.plateNumber ?? ""} có trong danh sách.`));
+  } else if (master.match === "near") {
+    checks.push(check("YARD_VEHICLE", "Xe có trong bãi (master data)", "warn", `Biển quét lệch 1 ký tự so với xe ${master.plateNumber ?? ""}; kiểm tra lại biển.`));
+  } else {
+    checks.push(check("YARD_VEHICLE", "Xe có trong bãi (master data)", "fail", "Không tìm thấy xe ở bãi."));
+  }
 
   if (capture.ocrConfidence === null) {
     checks.push(check("OCR_CONFIDENCE", "Độ tin cậy đọc biển", "skipped", "Không có điểm OCR."));
@@ -147,7 +156,21 @@ export function runChecks(
   return checks;
 }
 
-export function deriveStatus(checks: VerificationCheck[], weighing: WeighSummary | null): VerificationStatus {
+/**
+ * Trạng thái ra/vào: một lần cân (dù là field gross hay tare) = xe ĐÃ VÀO, đang chờ cân lần còn lại khi ra.
+ * Đủ cả hai lần = ĐÃ RA, lượt khép kín. Tách khỏi VerificationStatus vì đó là kết quả kiểm tra chéo, không phải vòng đời xe.
+ */
+export function computeVisitStatus(weighing: WeighSummary | null): VisitStatus | null {
+  if (weighing === null) {
+    return null;
+  }
+  return weighing.grossKg !== null && weighing.tareKg !== null ? "EXITED" : "ENTERED";
+}
+
+export function deriveStatus(checks: VerificationCheck[], weighing: WeighSummary | null, master: MasterLink): VerificationStatus {
+  if (master.match === "none") {
+    return "NOT_IN_YARD";
+  }
   if (weighing === null) {
     return "WAITING_WEIGHT";
   }
@@ -200,4 +223,23 @@ export function secondWeighScore(
     return null;
   }
   return 2 - distance - gapSeconds / windowSeconds;
+}
+
+/** Lý do của trạng thái, để người vận hành biết vì sao xe cần xem lại / không khớp. */
+export function deriveReasons(status: VerificationStatus, checks: VerificationCheck[]): string[] {
+  const describe = (item: VerificationCheck): string => `${item.label}: ${item.detail}`;
+  switch (status) {
+    case "NOT_IN_YARD":
+      return checks.filter((item) => item.code === "YARD_VEHICLE").map(describe);
+    case "WAITING_WEIGHT":
+      return ["Chưa có số liệu cân đầu vào."];
+    case "WAITING_SECOND_WEIGH":
+      return ["Xe đã vào bãi, đang chờ cân đầu ra."];
+    case "MISMATCH":
+      return checks.filter((item) => item.result === "fail").map(describe);
+    case "REVIEW_REQUIRED":
+      return checks.filter((item) => item.result === "warn").map(describe);
+    default:
+      return [];
+  }
 }

@@ -131,6 +131,13 @@ export class GateController {
     return this.gatePasses.getPass(id);
   }
 
+  /** Phân loại loại đá cho các lượt đã có ảnh vùng hàng nhưng chưa có loại đá. */
+  @Post("passes/reclassify-materials")
+  @HttpCode(200)
+  public reclassifyMaterials(): Promise<{ checked: number; classified: number; removedNotCargo: number }> {
+    return this.gatePasses.reclassifyMaterials();
+  }
+
   @Post("passes/:id/confirm")
   @HttpCode(200)
   public confirm(@Param("id") id: string, @Body() body: JsonBody): GatePass {

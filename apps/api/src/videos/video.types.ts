@@ -2,7 +2,8 @@ export const VIDEO_STATUS = {
   pending: "PENDING",
   processing: "PROCESSING",
   completed: "COMPLETED",
-  failed: "FAILED"
+  failed: "FAILED",
+  cancelled: "CANCELLED"
 } as const;
 
 export type VideoStatus = (typeof VIDEO_STATUS)[keyof typeof VIDEO_STATUS];
@@ -10,7 +11,7 @@ export type VideoStatus = (typeof VIDEO_STATUS)[keyof typeof VIDEO_STATUS];
 export interface DetectionClassification {
   code: string | null;
   confidence: number | null;
-  source: "model" | "operator" | "unavailable";
+  source: "model" | "zero-shot" | "operator" | "unavailable";
 }
 
 export interface DetectionPlateRegion {

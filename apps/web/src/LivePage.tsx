@@ -1,6 +1,6 @@
 import { ChangeEvent, ReactElement, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { API_BASE_URL, API_ORIGIN, PassDetail, STATUS_LABELS, formatKg, formatTime, request, useGateCatalog } from "./PassDetail";
+import { API_BASE_URL, API_ORIGIN, PassDetail, STATUS_LABELS, VISIT_LABELS, formatKg, formatTime, request, useGateCatalog, weighLegs } from "./PassDetail";
 import type { GatePass } from "./PassDetail";
 import VideoOverlay from "./VideoOverlay";
 
@@ -8,7 +8,7 @@ type GateEvent = { type: "upsert"; pass: GatePass } | { type: "remove"; id: stri
 
 interface Job {
   id: string;
-  status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED";
+  status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELLED";
   progress: number;
   inputUrl: string;
   errorMessage: string | null;
@@ -25,7 +25,7 @@ interface ClearResult {
 }
 
 const VISIBLE_ROWS = 100;
-const JOB_LABELS: Record<Job["status"], string> = { PENDING: "Đang chờ", PROCESSING: "Đang nhận diện", COMPLETED: "Hoàn tất", FAILED: "Thất bại" };
+const JOB_LABELS: Record<Job["status"], string> = { PENDING: "Đang chờ", PROCESSING: "Đang nhận diện", COMPLETED: "Hoàn tất", FAILED: "Thất bại", CANCELLED: "Đã dừng" };
 
 async function uploadVideo(file: File): Promise<Job> {
   const formData = new FormData();
@@ -57,6 +57,7 @@ export default function LivePage(): ReactElement {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [fileKey, setFileKey] = useState(0);
 
   const jobQuery = useQuery({
     queryKey: ["live-job", jobId],
@@ -68,7 +69,8 @@ export default function LivePage(): ReactElement {
       return (await response.json()) as Job;
     },
     enabled: jobId !== null,
-    refetchInterval: (query) => (query.state.data?.status === "COMPLETED" || query.state.data?.status === "FAILED" ? false : 1500)
+    retry: false,
+    refetchInterval: (query) => (["COMPLETED", "FAILED", "CANCELLED"].includes(query.state.data?.status ?? "") ? false : 1500)
   });
   const sizeQuery = useQuery({ queryKey: ["gate-captures"], queryFn: () => request<CaptureList>("/captures"), refetchInterval: 5000 });
   const upload = useMutation({
@@ -76,8 +78,23 @@ export default function LivePage(): ReactElement {
     onSuccess: (job) => {
       setJobId(job.id);
       setFile(null);
+      setFileKey((key) => key + 1);
       setSelectedId(null);
       setMessage(null);
+    },
+    onError: (error: unknown) => setMessage(error instanceof Error ? error.message : "Có lỗi xảy ra.")
+  });
+  const stop = useMutation({
+    mutationFn: (id: string) => fetch(`${API_BASE_URL}/videos/${id}/cancel`, { method: "POST" }).then(async (response) => {
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+        throw new Error(payload?.message ?? "Không dừng được video.");
+      }
+      return (await response.json()) as Job;
+    }),
+    onSuccess: (job) => {
+      queryClient.setQueryData(["live-job", job.id], job);
+      void queryClient.invalidateQueries({ queryKey: ["live-job", job.id] });
     },
     onError: (error: unknown) => setMessage(error instanceof Error ? error.message : "Có lỗi xảy ra.")
   });
@@ -89,6 +106,14 @@ export default function LivePage(): ReactElement {
     },
     onError: (error: unknown) => setMessage(error instanceof Error ? error.message : "Có lỗi xảy ra.")
   });
+
+  // Job mất (API khởi động lại) thì bỏ trạng thái cũ để có thể chọn video mới.
+  useEffect(() => {
+    if (jobQuery.isError) {
+      setJobId(null);
+      setMessage("Phiên nhận diện cũ không còn (API đã khởi động lại). Chọn video để chạy lại.");
+    }
+  }, [jobQuery.isError]);
 
   useEffect(() => {
     let cancelled = false;
@@ -143,11 +168,16 @@ export default function LivePage(): ReactElement {
           <span className={`status-pill ${connected ? "gate-verified" : "gate-mismatch"}`}>{connected ? "Đang nhận" : "Mất kết nối"}</span>
         </div>
         <label className="live-file">Chọn video để nhận diện
-          <input accept="video/*" type="file" onChange={(event: ChangeEvent<HTMLInputElement>) => setFile(event.target.files?.[0] ?? null)} />
+          <input accept="video/*" key={fileKey} type="file" onChange={(event: ChangeEvent<HTMLInputElement>) => setFile(event.target.files?.[0] ?? null)} />
         </label>
-        <button className="primary-button" disabled={file === null || upload.isPending} type="button" onClick={() => file !== null && upload.mutate(file)}>
+        <button className="primary-button" disabled={file === null || upload.isPending || processing} type="button" onClick={() => file !== null && upload.mutate(file)}>
           {upload.isPending ? "Đang upload…" : "Bắt đầu nhận diện"}
         </button>
+        {processing && job !== null && (
+          <button className="danger-button live-stop" disabled={stop.isPending} type="button" onClick={() => stop.mutate(job.id)}>
+            {stop.isPending ? "Đang dừng…" : "Dừng nhận diện"}
+          </button>
+        )}
         {job !== null && (
           <div className="live-job">
             <strong>{job.originalName}</strong>
@@ -173,12 +203,21 @@ export default function LivePage(): ReactElement {
 
         <div className="job-list gate-list">
           {rows.length === 0 && <p className="muted-text">Chưa có lượt nào. Chọn video rồi bấm Bắt đầu nhận diện.</p>}
-          {rows.slice(0, VISIBLE_ROWS).map((row) => (
-            <button className={`job-item ${row.id === selected?.id ? "active" : ""}`} key={row.id} type="button" onClick={() => selectRow(row)}>
-              <span className="job-copy"><strong>{row.effective.plateNumber}</strong><small>{formatTime(row.capture.capturedAt)} · {formatKg(row.weighing?.grossKg ?? null)}</small></span>
-              <span className={`status-pill gate-${row.status.toLowerCase()}`}>{STATUS_LABELS[row.status]}</span>
-            </button>
-          ))}
+          {rows.slice(0, VISIBLE_ROWS).map((row) => {
+            const legs = weighLegs(row.weighing);
+            return (
+              <button className={`job-item ${row.id === selected?.id ? "active" : ""}`} key={row.id} type="button" onClick={() => selectRow(row)}>
+                <span className="job-copy">
+                  <strong>{row.effective.plateNumber}</strong>
+                  <small>
+                    {formatTime(row.capture.capturedAt)} · {formatKg((legs.exit ?? legs.entry)?.kg ?? null)}
+                    {row.visitStatus !== null && <span className={`visit-tag visit-${row.visitStatus.toLowerCase()}`}>{VISIT_LABELS[row.visitStatus]}</span>}
+                  </small>
+                </span>
+                <span className={`status-pill gate-${row.status.toLowerCase()}`}>{STATUS_LABELS[row.status]}</span>
+              </button>
+            );
+          })}
         </div>
       </aside>
 

@@ -16,3 +16,4 @@ __pycache__/
 
 storage/samples/
 .playwright-mcp/
+storage/*.json
