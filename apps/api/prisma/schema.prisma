@@ -1,0 +1,111 @@
+// Camera AI System — schema dữ liệu.
+//
+// Chiến lược: các cột hay lọc/sắp xếp (plateNormalized, status, visitStatus, resolution,
+// capturedAt) là cột thật có index, để truy vấn nhanh và an toàn kiểu ở tầng DB.
+// Phần nghiệp vụ lồng nhau (lượt nhận diện vào/ra, chi tiết kiểm tra chéo, nhật ký) lưu dạng JSONB,
+// giữ nguyên hình dạng đã có trong apps/api/src/gate/gate.types.ts — không phải chuẩn hoá hết
+// thành bảng con mới có ý nghĩa cho dữ liệu gần như bất biến này. Không lưu ảnh/file — chỉ số liệu.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Một xe trong danh sách master data của bãi.
+model Vehicle {
+  id               String   @id @default(uuid())
+  plateNumber      String
+  plateNormalized  String   @unique
+  vehicleType      String?
+  note             String   @default("")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  drivers          Driver[]
+
+  @@index([plateNormalized])
+}
+
+/// Tài xế gắn với một xe; xoá xe thì xoá luôn tài xế của xe đó.
+model Driver {
+  id         String   @id @default(uuid())
+  vehicleId  String
+  vehicle    Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  fullName   String
+  phone      String   @default("")
+  licenseNo  String   @default("")
+  note       String   @default("")
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([vehicleId])
+}
+
+/// Một lượt xe (vào, có thể cả ra), gộp camera + cân + kiểm tra chéo + nhật ký.
+model GatePass {
+  id              String    @id @default(uuid())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  /// yyyy-mm-dd... lấy từ capture.capturedAt, cột thật để lọc theo ngày/sắp xếp nhanh.
+  capturedAt      DateTime
+  plateNormalized String
+
+  /// "NOT_IN_YARD" | "WAITING_WEIGHT" | "WAITING_SECOND_WEIGH" | "VERIFIED" | "REVIEW_REQUIRED" | "MISMATCH"
+  status          String
+  /// "ENTERED" | "EXITED"
+  visitStatus     String
+  /// "PENDING" | "CONFIRMED" | "REJECTED"
+  resolution      String    @default("PENDING")
+
+  // Bằng chứng và kết quả — giữ nguyên hình dạng TypeScript, lưu JSONB.
+  capture         Json
+  exitCapture     Json?
+  vehicleType     Json
+  material        Json
+  weighing        Json?
+  checks          Json
+  statusReasons   Json
+  overrides       Json
+  effective       Json
+  master          Json
+  audit           Json
+
+  readings        WeighReading[]
+
+  @@index([plateNormalized])
+  @@index([status])
+  @@index([resolution])
+  @@index([capturedAt])
+}
+
+/// Một lần cân từ trạm cân ngoài (hoặc giả lập); chỉ có grossKg hoặc tareKg, không có cả hai.
+model WeighReading {
+  id          String    @id @default(uuid())
+  scaleId     String
+  ticketNo    String?
+  plateNumber String?
+  grossKg     Float?
+  tareKg      Float?
+  measuredAt  DateTime
+  receivedAt  DateTime  @default(now())
+  /// "external" | "mock"
+  source      String
+  gatePassId  String?
+  gatePass    GatePass? @relation(fields: [gatePassId], references: [id], onDelete: SetNull)
+
+  @@index([gatePassId])
+  @@index([plateNumber])
+}
+
+/// Cấu hình bot Telegram — một dòng duy nhất (id cố định "default").
+model TelegramConfig {
+  id          String  @id @default("default")
+  botToken    String  @default("")
+  botUsername String  @default("")
+  chatId      String  @default("")
+  chatTitle   String  @default("")
+}

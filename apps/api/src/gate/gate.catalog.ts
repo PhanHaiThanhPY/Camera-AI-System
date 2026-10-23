@@ -23,8 +23,10 @@ export const VEHICLE_PROFILES: VehicleProfile[] = [
 
 export const MATERIALS: CatalogItem[] = [
   { code: "empty", label: "Không chở hàng" },
-  { code: "da_bi", label: "Đá bi" },
-  { code: "da_vuong", label: "Đá vuông" }
+  { code: "sand", label: "Cát" },
+  { code: "stone_2_3", label: "Đá 2–3" },
+  { code: "stone_4_6", label: "Đá 4–6" },
+  { code: "boulder", label: "Đá tảng" }
 ];
 
 export const EMPTY_MATERIAL = "empty";

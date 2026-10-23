@@ -76,46 +76,46 @@ export class MasterController {
   }
 
   @Post("vehicles")
-  public createVehicle(@Body() body: JsonBody): Vehicle {
+  public createVehicle(@Body() body: JsonBody): Promise<Vehicle> {
     return this.master.createVehicle(parseVehicle(body));
   }
 
   /** Nhập các biển số đã chụp (chưa có trong danh sách) làm xe của master data. */
   @Post("vehicles/import-captured")
   @HttpCode(200)
-  public importCaptured(): { created: number; skipped: number } {
+  public async importCaptured(): Promise<{ created: number; skipped: number }> {
     const seen = new Set<string>();
-    const plates = this.gatePasses
-      .listPasses()
+    const passes = await this.gatePasses.listPasses();
+    const plates = passes
       .map((pass) => ({ plateNumber: pass.effective.plateNumber, vehicleType: pass.effective.vehicleType }))
       .filter((item) => !seen.has(item.plateNumber) && seen.add(item.plateNumber));
     return this.master.importPlates(plates);
   }
 
   @Patch("vehicles/:id")
-  public updateVehicle(@Param("id") id: string, @Body() body: JsonBody): Vehicle {
+  public updateVehicle(@Param("id") id: string, @Body() body: JsonBody): Promise<Vehicle> {
     return this.master.updateVehicle(id, parseVehicle(body));
   }
 
   @Delete("vehicles/:id")
-  public deleteVehicle(@Param("id") id: string): { removedDrivers: number } {
+  public deleteVehicle(@Param("id") id: string): Promise<{ removedDrivers: number }> {
     return this.master.deleteVehicle(id);
   }
 
   @Post("vehicles/:id/drivers")
-  public createDriver(@Param("id") id: string, @Body() body: JsonBody): Driver {
+  public createDriver(@Param("id") id: string, @Body() body: JsonBody): Promise<Driver> {
     return this.master.createDriver(id, parseDriver(body));
   }
 
   @Patch("drivers/:id")
-  public updateDriver(@Param("id") id: string, @Body() body: JsonBody): Driver {
+  public updateDriver(@Param("id") id: string, @Body() body: JsonBody): Promise<Driver> {
     return this.master.updateDriver(id, parseDriver(body));
   }
 
   @Delete("drivers/:id")
   @HttpCode(200)
-  public deleteDriver(@Param("id") id: string): { ok: true } {
-    this.master.deleteDriver(id);
+  public async deleteDriver(@Param("id") id: string): Promise<{ ok: true }> {
+    await this.master.deleteDriver(id);
     return { ok: true };
   }
 }

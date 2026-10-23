@@ -9,42 +9,18 @@ export interface Classification {
   source: ClassificationSource;
 }
 
-/** Vùng biển số dạng tứ giác, toạ độ chuẩn hoá 0..1 theo frame gốc, thứ tự TL, TR, BR, BL. */
-export interface PlateRegion {
-  points: [number, number][];
-  frameWidth: number | null;
-  frameHeight: number | null;
-  source: "model-contour" | "model-bbox";
-}
-
-export interface RegionBox {
-  /** x1, y1, x2, y2 chuẩn hoá 0..1 theo frame gốc. */
-  box: [number, number, number, number];
-  source: "model" | "heuristic";
-}
-
+/** Một lần nhận diện biển số, không giữ ảnh/khung — chỉ số liệu để chạy nghiệp vụ. */
 export interface PlateCapture {
-  /** "weighbridge" = lượt không có ảnh camera, tạo thẳng từ số liệu cân (ví dụ xe cân lại sau khi đã vào/ra xong lượt trước). */
+  /** "weighbridge" = lượt tạo thẳng từ số liệu cân, không qua nhận diện biển số. */
   source: "video" | "weighbridge";
-  videoJobId: string | null;
   cameraId: string;
   clockSource: "server" | "camera";
   capturedAt: string;
-  mediaTimeSec: number | null;
-  overviewUrl: string | null;
-  plateCropUrl: string | null;
-  vehicleImageUrl: string | null;
-  loadImageUrl: string | null;
-  vehicleBox: RegionBox | null;
-  loadBox: RegionBox | null;
   trackId: string;
-  /** [giây, x1, y1, x2, y2] chuẩn hoá: vị trí biển số theo thời gian để vẽ khung trên video. */
-  trail: [number, number, number, number, number][];
   plateText: string;
   plateNormalized: string;
   ocrConfidence: number | null;
   detectorConfidence: number | null;
-  plateRegion: PlateRegion | null;
 }
 
 /** Một lần cân từ trạm cân ngoài. grossKg = xe + hàng, tareKg = xe không; mỗi lần cân thường chỉ có một trong hai. */
@@ -116,7 +92,7 @@ export interface GatePass {
   createdAt: string;
   updatedAt: string;
   capture: PlateCapture;
-  /** Ảnh chụp lúc xe ra (biển/xe/đá/toàn cảnh) — null khi xe chưa ra, hoặc lượt này không có camera xác nhận lúc ra. */
+  /** Lượt nhận diện lúc xe ra — null khi xe chưa ra, hoặc lượt này không có camera xác nhận lúc ra. */
   exitCapture: PlateCapture | null;
   vehicleType: Classification;
   material: Classification;
@@ -125,11 +101,29 @@ export interface GatePass {
   status: VerificationStatus;
   /** Lý do dẫn tới trạng thái hiện tại (rỗng khi Khớp). */
   statusReasons: string[];
-  /** Trạng thái ra/vào bãi, tách khỏi status (status là kết quả kiểm tra chéo). null = chưa cân lần nào. */
-  visitStatus: VisitStatus | null;
+  /** Trạng thái ra/vào bãi theo camera, tách khỏi status (status là kết quả kiểm tra chéo, phụ thuộc cân). */
+  visitStatus: VisitStatus;
   resolution: Resolution;
   overrides: GateOverrides;
   /** Giá trị đang có hiệu lực sau khi áp dụng override của người vận hành. */
   effective: { plateNumber: string; vehicleType: string | null; material: string | null };
   audit: AuditEntry[];
+}
+
+/**
+ * Một lượt nhận diện đẩy về từ lớp Python (xem services/ai-worker trước đây, nay python/detect) qua
+ * `POST /api/gate/detections`. Không còn ảnh/khung — chỉ số liệu để ghép lượt xe và chạy nghiệp vụ.
+ */
+export interface DetectionInput {
+  cameraId: string;
+  /** Mã theo dõi một xe xuyên suốt phiên nhận diện (ví dụ track id của tracker); trống thì ghép theo biển số. */
+  trackId?: string;
+  plateNumber: string;
+  ocrConfidence?: number | null;
+  detectorConfidence?: number | null;
+  vehicleType?: Classification;
+  material?: Classification;
+  capturedAt?: string;
+  /** true khi đây là lần cập nhật cuối của track này (đã đủ tin cậy để chốt). */
+  final?: boolean;
 }

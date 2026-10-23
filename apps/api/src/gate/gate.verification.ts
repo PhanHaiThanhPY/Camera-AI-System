@@ -157,14 +157,14 @@ export function runChecks(
 }
 
 /**
- * Trạng thái ra/vào: một lần cân (dù là field gross hay tare) = xe ĐÃ VÀO, đang chờ cân lần còn lại khi ra.
- * Đủ cả hai lần = ĐÃ RA, lượt khép kín. Tách khỏi VerificationStatus vì đó là kết quả kiểm tra chéo, không phải vòng đời xe.
+ * Trạng thái ra/vào: theo CAMERA thấy xe (độc lập với cân, vì cân có thể tắt hoặc chưa nối trạm thật).
+ * Có record (dù từ camera hay từ cân) = ĐÃ VÀO. Camera thấy lại xe lúc ra (exitCapture) HOẶC đủ cả hai lần
+ * cân (trường hợp record tạo thẳng từ cân, không có camera) = ĐÃ RA, lượt khép kín.
  */
-export function computeVisitStatus(weighing: WeighSummary | null): VisitStatus | null {
-  if (weighing === null) {
-    return null;
-  }
-  return weighing.grossKg !== null && weighing.tareKg !== null ? "EXITED" : "ENTERED";
+export function computeVisitStatus(pass: Pick<GatePass, "exitCapture" | "weighing">): VisitStatus {
+  const exitedByCamera = pass.exitCapture !== null;
+  const exitedByWeighing = pass.weighing !== null && pass.weighing.grossKg !== null && pass.weighing.tareKg !== null;
+  return exitedByCamera || exitedByWeighing ? "EXITED" : "ENTERED";
 }
 
 export function deriveStatus(checks: VerificationCheck[], weighing: WeighSummary | null, master: MasterLink): VerificationStatus {

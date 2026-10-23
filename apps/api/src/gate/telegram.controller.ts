@@ -36,7 +36,7 @@ export class TelegramController {
   public constructor(private readonly telegram: TelegramService) {}
 
   @Get("config")
-  public getConfig(): PublicConfig {
+  public getConfig(): Promise<PublicConfig> {
     return this.telegram.getConfig();
   }
 
@@ -60,13 +60,13 @@ export class TelegramController {
 
   @Post("token/reveal")
   @HttpCode(200)
-  public revealToken(@Headers("origin") origin: string | undefined): { botToken: string } {
+  public revealToken(@Headers("origin") origin: string | undefined): Promise<{ botToken: string }> {
     assertTrustedOrigin(origin);
     return this.telegram.revealToken();
   }
 
   @Delete("config")
-  public clearConfig(): PublicConfig {
+  public clearConfig(): Promise<PublicConfig> {
     return this.telegram.clearConfig();
   }
 

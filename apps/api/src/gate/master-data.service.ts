@@ -1,19 +1,13 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import type { OnModuleInit } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { Subject } from "rxjs";
 import { findVehicleProfile } from "./gate.catalog";
 import { editDistance, normalizePlate } from "./gate.verification";
-import { JsonStore } from "./json-store";
+// NestJS needs the runtime class token for constructor dependency injection.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { PrismaService } from "../prisma/prisma.service";
 import { NO_MASTER_LINK } from "./master.types";
 import type { Driver, MasterLink, Vehicle } from "./master.types";
-
-const storageRoot = process.env.STORAGE_ROOT ?? join(process.cwd(), "../../storage");
-
-interface MasterState {
-  vehicles: Vehicle[];
-  drivers: Driver[];
-}
 
 export interface VehicleInput {
   plateNumber?: string;
@@ -29,22 +23,32 @@ export interface DriverInput {
   isPrimary?: boolean;
 }
 
+/**
+ * Postgres là nguồn dữ liệu, nhưng khác GatePass (lịch sử không ngừng lớn lên), danh sách xe trong bãi
+ * có kích thước bị chặn tự nhiên (số xe của đội xe thực tế — vài chục đến vài trăm), và `lookup()` cần
+ * chạy đồng bộ/nhanh trên MỖI lần refresh một GatePass. Vì vậy service này giữ một bộ nhớ đệm đầy đủ,
+ * nạp một lần lúc khởi động và ghi-qua (write-through) ở mọi thao tác sửa — khác hẳn với việc không cache
+ * gì (GatePassesService) hay cache không giới hạn kiểu file JSON cũ.
+ */
 @Injectable()
-export class MasterDataService {
-  private readonly store = new JsonStore<MasterState>(join(storageRoot, "master-data.json"));
+export class MasterDataService implements OnModuleInit {
+  private readonly logger = new Logger(MasterDataService.name);
   private readonly vehicles = new Map<string, Vehicle>();
   private readonly drivers = new Map<string, Driver>();
   /** Phát mỗi khi master data đổi để các lượt quét được đối chiếu lại. */
   public readonly changes = new Subject<void>();
 
-  public constructor() {
-    const state = this.store.load();
-    for (const vehicle of state?.vehicles ?? []) {
-      this.vehicles.set(vehicle.id, vehicle);
+  public constructor(private readonly prisma: PrismaService) {}
+
+  public async onModuleInit(): Promise<void> {
+    const [vehicles, drivers] = await Promise.all([this.prisma.vehicle.findMany(), this.prisma.driver.findMany()]);
+    for (const vehicle of vehicles) {
+      this.vehicles.set(vehicle.id, toDomainVehicle(vehicle));
     }
-    for (const driver of state?.drivers ?? []) {
-      this.drivers.set(driver.id, driver);
+    for (const driver of drivers) {
+      this.drivers.set(driver.id, toDomainDriver(driver));
     }
+    this.logger.log(`Đã nạp master data: ${this.vehicles.size} xe, ${this.drivers.size} tài xế.`);
   }
 
   public listVehicles(): (Vehicle & { drivers: Driver[] })[] {
@@ -53,47 +57,45 @@ export class MasterDataService {
       .map((vehicle) => ({ ...vehicle, drivers: this.driversOf(vehicle.id) }));
   }
 
-  public createVehicle(input: VehicleInput): Vehicle {
+  public async createVehicle(input: VehicleInput): Promise<Vehicle> {
     const plate = this.validPlate(input.plateNumber);
     this.assertUnique(plate.normalized, null);
-    const now = new Date().toISOString();
-    const vehicle: Vehicle = {
-      id: randomUUID(),
-      plateNumber: plate.display,
-      plateNormalized: plate.normalized,
-      vehicleType: this.validType(input.vehicleType),
-      note: input.note ?? "",
-      createdAt: now,
-      updatedAt: now
-    };
+    const row = await this.prisma.vehicle.create({
+      data: { plateNumber: plate.display, plateNormalized: plate.normalized, vehicleType: this.validType(input.vehicleType), note: input.note ?? "" }
+    });
+    const vehicle = toDomainVehicle(row);
     this.vehicles.set(vehicle.id, vehicle);
     this.changed();
     return vehicle;
   }
 
-  public updateVehicle(id: string, input: VehicleInput): Vehicle {
-    const vehicle = this.getVehicle(id);
+  public async updateVehicle(id: string, input: VehicleInput): Promise<Vehicle> {
+    const current = this.getVehicle(id);
+    const data: { plateNumber?: string; plateNormalized?: string; vehicleType?: string | null; note?: string } = {};
     if (input.plateNumber !== undefined) {
       const plate = this.validPlate(input.plateNumber);
       this.assertUnique(plate.normalized, id);
-      vehicle.plateNumber = plate.display;
-      vehicle.plateNormalized = plate.normalized;
+      data.plateNumber = plate.display;
+      data.plateNormalized = plate.normalized;
     }
     if (input.vehicleType !== undefined) {
-      vehicle.vehicleType = this.validType(input.vehicleType);
+      data.vehicleType = this.validType(input.vehicleType);
     }
     if (input.note !== undefined) {
-      vehicle.note = input.note;
+      data.note = input.note;
     }
-    vehicle.updatedAt = new Date().toISOString();
+    const row = await this.prisma.vehicle.update({ where: { id: current.id }, data });
+    const vehicle = toDomainVehicle(row);
+    this.vehicles.set(vehicle.id, vehicle);
     this.changed();
     return vehicle;
   }
 
-  /** Xoá xe kèm toàn bộ tài xế của xe đó. */
-  public deleteVehicle(id: string): { removedDrivers: number } {
+  /** Xoá xe kèm toàn bộ tài xế của xe đó (cascade ở DB). */
+  public async deleteVehicle(id: string): Promise<{ removedDrivers: number }> {
     this.getVehicle(id);
     const owned = this.driversOf(id);
+    await this.prisma.vehicle.delete({ where: { id } });
     for (const driver of owned) {
       this.drivers.delete(driver.id);
     }
@@ -102,68 +104,73 @@ export class MasterDataService {
     return { removedDrivers: owned.length };
   }
 
-  public createDriver(vehicleId: string, input: DriverInput): Driver {
+  public async createDriver(vehicleId: string, input: DriverInput): Promise<Driver> {
     this.getVehicle(vehicleId);
     const fullName = input.fullName?.trim();
     if (fullName === undefined || fullName === "") {
       throw new BadRequestException("Họ tên tài xế là bắt buộc.");
     }
-    const now = new Date().toISOString();
-    const driver: Driver = {
-      id: randomUUID(),
-      vehicleId,
-      fullName,
-      phone: input.phone ?? "",
-      licenseNo: input.licenseNo ?? "",
-      note: input.note ?? "",
-      // Tài xế đầu tiên của xe mặc định là tài xế chính.
-      isPrimary: input.isPrimary ?? this.driversOf(vehicleId).length === 0,
-      createdAt: now,
-      updatedAt: now
-    };
+    // Tài xế đầu tiên của xe mặc định là tài xế chính.
+    const isPrimary = input.isPrimary ?? this.driversOf(vehicleId).length === 0;
+    const row = await this.prisma.driver.create({
+      data: { vehicleId, fullName, phone: input.phone ?? "", licenseNo: input.licenseNo ?? "", note: input.note ?? "", isPrimary }
+    });
+    const driver = toDomainDriver(row);
     this.drivers.set(driver.id, driver);
     if (driver.isPrimary) {
-      this.demoteOthers(driver);
+      await this.demoteOthers(driver);
     }
     this.changed();
     return driver;
   }
 
-  public updateDriver(id: string, input: DriverInput): Driver {
-    const driver = this.getDriver(id);
+  public async updateDriver(id: string, input: DriverInput): Promise<Driver> {
+    const current = this.getDriver(id);
+    if (input.fullName !== undefined && input.fullName.trim() === "") {
+      throw new BadRequestException("Họ tên tài xế là bắt buộc.");
+    }
+    const data: { fullName?: string; phone?: string; licenseNo?: string; note?: string; isPrimary?: boolean } = {};
     if (input.fullName !== undefined) {
-      if (input.fullName.trim() === "") {
-        throw new BadRequestException("Họ tên tài xế là bắt buộc.");
-      }
-      driver.fullName = input.fullName.trim();
+      data.fullName = input.fullName.trim();
     }
-    driver.phone = input.phone ?? driver.phone;
-    driver.licenseNo = input.licenseNo ?? driver.licenseNo;
-    driver.note = input.note ?? driver.note;
+    if (input.phone !== undefined) {
+      data.phone = input.phone;
+    }
+    if (input.licenseNo !== undefined) {
+      data.licenseNo = input.licenseNo;
+    }
+    if (input.note !== undefined) {
+      data.note = input.note;
+    }
     if (input.isPrimary !== undefined) {
-      driver.isPrimary = input.isPrimary;
-      if (driver.isPrimary) {
-        this.demoteOthers(driver);
-      }
+      data.isPrimary = input.isPrimary;
     }
-    driver.updatedAt = new Date().toISOString();
+    const row = await this.prisma.driver.update({ where: { id: current.id }, data });
+    const driver = toDomainDriver(row);
+    this.drivers.set(driver.id, driver);
+    if (driver.isPrimary) {
+      await this.demoteOthers(driver);
+    }
     this.changed();
     return driver;
   }
 
-  public deleteDriver(id: string): void {
+  public async deleteDriver(id: string): Promise<void> {
     const driver = this.getDriver(id);
+    await this.prisma.driver.delete({ where: { id } });
     this.drivers.delete(id);
     // Xoá tài xế chính thì chuyển vai trò cho người còn lại đầu tiên.
     const rest = this.driversOf(driver.vehicleId);
-    if (driver.isPrimary && rest[0] !== undefined) {
-      rest[0].isPrimary = true;
+    const successor = rest[0];
+    if (driver.isPrimary && successor !== undefined) {
+      await this.prisma.driver.update({ where: { id: successor.id }, data: { isPrimary: true } });
+      this.drivers.set(successor.id, { ...successor, isPrimary: true });
     }
     this.changed();
   }
 
   /** Thêm xe từ danh sách biển số quét được; bỏ qua biển đã có. */
-  public importPlates(plates: { plateNumber: string; vehicleType: string | null }[]): { created: number; skipped: number } {
+  public async importPlates(plates: { plateNumber: string; vehicleType: string | null }[]): Promise<{ created: number; skipped: number }> {
     let created = 0;
     let skipped = 0;
     for (const item of plates) {
@@ -172,17 +179,15 @@ export class MasterDataService {
         skipped += 1;
         continue;
       }
-      const now = new Date().toISOString();
-      const vehicle: Vehicle = {
-        id: randomUUID(),
-        plateNumber: item.plateNumber.trim(),
-        plateNormalized: normalized,
-        vehicleType: item.vehicleType !== null && findVehicleProfile(item.vehicleType) !== undefined ? item.vehicleType : null,
-        note: "Nhập từ danh sách ảnh đã chụp",
-        createdAt: now,
-        updatedAt: now
-      };
-      this.vehicles.set(vehicle.id, vehicle);
+      const row = await this.prisma.vehicle.create({
+        data: {
+          plateNumber: item.plateNumber.trim(),
+          plateNormalized: normalized,
+          vehicleType: item.vehicleType !== null && findVehicleProfile(item.vehicleType) !== undefined ? item.vehicleType : null,
+          note: "Nhập từ danh sách ảnh đã chụp"
+        }
+      });
+      this.vehicles.set(row.id, toDomainVehicle(row));
       created += 1;
     }
     if (created > 0) {
@@ -223,11 +228,11 @@ export class MasterDataService {
       .sort((first, second) => Number(second.isPrimary) - Number(first.isPrimary) || first.createdAt.localeCompare(second.createdAt));
   }
 
-  private demoteOthers(keep: Driver): void {
-    for (const other of this.driversOf(keep.vehicleId)) {
-      if (other.id !== keep.id) {
-        other.isPrimary = false;
-      }
+  private async demoteOthers(keep: Driver): Promise<void> {
+    const others = this.driversOf(keep.vehicleId).filter((driver) => driver.id !== keep.id && driver.isPrimary);
+    for (const other of others) {
+      await this.prisma.driver.update({ where: { id: other.id }, data: { isPrimary: false } });
+      this.drivers.set(other.id, { ...other, isPrimary: false });
     }
   }
 
@@ -278,7 +283,42 @@ export class MasterDataService {
   }
 
   private changed(): void {
-    this.store.save(() => ({ vehicles: [...this.vehicles.values()], drivers: [...this.drivers.values()] }));
     this.changes.next();
   }
+}
+
+function toDomainVehicle(row: { id: string; plateNumber: string; plateNormalized: string; vehicleType: string | null; note: string; createdAt: Date; updatedAt: Date }): Vehicle {
+  return {
+    id: row.id,
+    plateNumber: row.plateNumber,
+    plateNormalized: row.plateNormalized,
+    vehicleType: row.vehicleType,
+    note: row.note,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString()
+  };
+}
+
+function toDomainDriver(row: {
+  id: string;
+  vehicleId: string;
+  fullName: string;
+  phone: string;
+  licenseNo: string;
+  note: string;
+  isPrimary: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}): Driver {
+  return {
+    id: row.id,
+    vehicleId: row.vehicleId,
+    fullName: row.fullName,
+    phone: row.phone,
+    licenseNo: row.licenseNo,
+    note: row.note,
+    isPrimary: row.isPrimary,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString()
+  };
 }

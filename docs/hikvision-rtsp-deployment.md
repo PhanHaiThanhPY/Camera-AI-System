@@ -133,7 +133,6 @@ Các chức năng cần triển khai:
 - Giới hạn số frame đưa vào AI worker.
 - Theo dõi trạng thái `ONLINE / OFFLINE / RECONNECTING`.
 - Ghi log lỗi camera.
-- Chụp ảnh bằng chứng khi biển số được xác nhận.
 - Không để lỗi một camera làm dừng toàn bộ API.
 - Có nút Start/Stop camera trong giao diện.
 - Có API kiểm tra trạng thái camera.
@@ -160,21 +159,18 @@ Tối thiểu nên có:
 - Python 3.11+.
 - FFmpeg.
 - RAM từ 16 GB cho một camera thử nghiệm.
-- SSD để lưu ảnh/video.
 - GPU NVIDIA nếu cần xử lý gần realtime hoặc nhiều camera.
 - UPS cho máy chủ, switch PoE và camera.
 - NTP cho máy chủ, camera, NVR và trạm cân.
 
 Khi chạy production nên bổ sung:
 
-- Docker Compose hoặc systemd để tự khởi động lại service.
-- PostgreSQL thay cho JSON/memory.
-- Redis/BullMQ cho hàng đợi frame/job.
-- Object storage cho video và ảnh bằng chứng.
+- Docker Compose hoặc systemd để tự khởi động lại service (NestJS, Postgres, tiến trình python/detect theo từng camera).
+- PostgreSQL đã thay JSON cho state cổng/master data/Telegram. Hệ thống không lưu ảnh/video bằng chứng — chỉ số liệu nhận diện, nên không cần object storage hay chính sách xoá media cũ.
+- Redis/BullMQ cho hàng đợi frame nếu số camera tăng và cần điều phối tải giữa các tiến trình python.
 - HTTPS, đăng nhập và phân quyền.
-- Backup tự động.
-- Chính sách xoá video/ảnh cũ.
-- Monitoring CPU, GPU, disk, camera và worker.
+- Backup tự động cho Postgres.
+- Monitoring CPU, GPU, disk, camera và tiến trình python.
 
 ## 8. Kiểm thử nghiệm thu
 

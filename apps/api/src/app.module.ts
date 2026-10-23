@@ -1,9 +1,9 @@
 import { Module } from "@nestjs/common";
 import { GateModule } from "./gate/gate.module";
-import { VideosModule } from "./videos/videos.module";
+import { PrismaModule } from "./prisma/prisma.module";
 
 @Module({
-  imports: [VideosModule, GateModule]
+  imports: [PrismaModule, GateModule]
 })
 export class AppModule {}
 

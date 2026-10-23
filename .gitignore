@@ -6,14 +6,8 @@ dist/
 .env
 .env.*
 !.env.example
-storage/uploads/*
-storage/results/*
-!storage/uploads/.gitkeep
-!storage/results/.gitkeep
-models/*.pt
+python/models/*.pt
 *.pyc
 __pycache__/
 
-storage/samples/
 .playwright-mcp/
-storage/*.json
