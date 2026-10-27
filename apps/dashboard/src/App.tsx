@@ -38,13 +38,34 @@ function todayLabel(): string {
   return `${String(now.getDate()).padStart(2, "0")}.${String(now.getMonth() + 1).padStart(2, "0")}.${now.getFullYear()}`;
 }
 
+const SIDEBAR_STORAGE_KEY = "camera-ai:sidebar-open";
+
+/** Chỉ là tiện ích riêng trình duyệt (nhớ trạng thái đóng/mở), không phải dữ liệu nghiệp vụ — lỗi thì bỏ qua. */
+function readSidebarOpen(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
 function App(): ReactElement {
   const [{ view, passId }, setRoute] = useState(readRoute);
+  const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen);
   useEffect(() => {
     const onHashChange = (): void => setRoute(readRoute());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+  const toggleSidebar = (): void => {
+    const next = !sidebarOpen;
+    setSidebarOpen(next);
+    try {
+      localStorage.setItem(SIDEBAR_STORAGE_KEY, String(next));
+    } catch {
+      // bỏ qua — chỉ là tiện ích nhớ trạng thái, không ảnh hưởng chức năng.
+    }
+  };
   const titles = passId !== null ? { title: "Chi tiết lượt xe", subtitle: "" } : VIEW_TITLES[view];
   const catalog = useGateCatalog();
   const { rows, connected, message } = useGateFeed();
@@ -52,17 +73,24 @@ function App(): ReactElement {
 
   return (
     <main className="app-shell">
-      <aside className="brand-sidebar">
-        <p className="brand-mark">VP HOLDING</p>
-        <p className="brand-sub">ĐIỀU HÀNH CÂN XE</p>
-        <nav className="brand-nav" aria-label="Menu">
-          {NAV_ITEMS.map((item) => (
-            <button aria-pressed={view === item.view} key={item.view} type="button" onClick={() => { window.location.hash = `/${item.view}`; }}>
-              <span className="brand-nav-num">{item.num}</span>{item.label}
-            </button>
-          ))}
-        </nav>
-        <p className="brand-footer"><strong>MỎ ĐÁ · MỎ CÁT · BÊ TÔNG</strong>Mỗi chuyến xe, một hồ sơ.</p>
+      <aside className={`brand-sidebar ${sidebarOpen ? "" : "brand-sidebar-collapsed"}`}>
+        <button aria-expanded={sidebarOpen} aria-label={sidebarOpen ? "Thu gọn menu" : "Mở rộng menu"} className="sidebar-toggle" type="button" onClick={toggleSidebar}>
+          {sidebarOpen ? "‹" : "›"}
+        </button>
+        {sidebarOpen && (
+          <>
+            <p className="brand-mark">VP HOLDING</p>
+            <p className="brand-sub">ĐIỀU HÀNH CÂN XE</p>
+            <nav className="brand-nav" aria-label="Menu">
+              {NAV_ITEMS.map((item) => (
+                <button aria-pressed={view === item.view} key={item.view} type="button" onClick={() => { window.location.hash = `/${item.view}`; }}>
+                  <span className="brand-nav-num">{item.num}</span>{item.label}
+                </button>
+              ))}
+            </nav>
+            <p className="brand-footer"><strong>MỎ ĐÁ · MỎ CÁT · BÊ TÔNG</strong>Mỗi chuyến xe, một hồ sơ.</p>
+          </>
+        )}
       </aside>
       <div className="content-area">
         <header className="topbar">
