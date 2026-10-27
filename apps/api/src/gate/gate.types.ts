@@ -9,7 +9,7 @@ export interface Classification {
   source: ClassificationSource;
 }
 
-/** Một lần nhận diện biển số, không giữ ảnh/khung — chỉ số liệu để chạy nghiệp vụ. */
+/** Một lần nhận diện biển số — số liệu để chạy nghiệp vụ, kèm ảnh bằng chứng (MinIO) nếu có. */
 export interface PlateCapture {
   /** "weighbridge" = lượt tạo thẳng từ số liệu cân, không qua nhận diện biển số. */
   source: "video" | "weighbridge";
@@ -21,6 +21,8 @@ export interface PlateCapture {
   plateNormalized: string;
   ocrConfidence: number | null;
   detectorConfidence: number | null;
+  /** Link ảnh (crop quanh vùng xe) đã upload lên MinIO bởi python/detect. null = chưa cấu hình MinIO hoặc lượt từ cân (weighbridge). */
+  imageUrl: string | null;
 }
 
 /** Một lần cân từ trạm cân ngoài. grossKg = xe + hàng, tareKg = xe không; mỗi lần cân thường chỉ có một trong hai. */
@@ -61,7 +63,15 @@ export interface VerificationCheck {
   detail: string;
 }
 
-export type VerificationStatus = "NOT_IN_YARD" | "WAITING_WEIGHT" | "WAITING_SECOND_WEIGH" | "VERIFIED" | "REVIEW_REQUIRED" | "MISMATCH";
+export type VerificationStatus =
+  | "NOT_IN_YARD"
+  | "WAITING_CAPTURE"
+  | "WAITING_WEIGHT"
+  | "WAITING_SECOND_WEIGH"
+  | "VERIFIED"
+  | "REVIEW_REQUIRED"
+  | "MISMATCH"
+  | "CAPTURE_FAILED";
 export type Resolution = "PENDING" | "CONFIRMED" | "REJECTED";
 /**
  * Vòng vào/ra của một lượt xe: ENTERED = đã cân đầu vào, đang trong bãi; EXITED = đã cân đầu ra, hoàn tất lượt
@@ -85,12 +95,44 @@ export interface AuditEntry {
   after: Record<string, unknown> | null;
 }
 
+/** Một lần camera gửi kết quả cho một đợt chờ chụp đang mở (xem GatePassesService.submitCaptureResult).
+ *  "ok" = đọc được biển rõ ràng; "blurry" = ảnh mờ (độ mờ dưới ngưỡng); "no_plate" = không tìm thấy biển số trong ảnh. */
+export interface CaptureShot {
+  cameraId: string;
+  plateNumber: string | null;
+  ocrConfidence: number | null;
+  detectorConfidence: number | null;
+  vehicleType?: Classification;
+  material?: Classification;
+  imageUrl?: string | null;
+  quality: "ok" | "blurry" | "no_plate";
+}
+
+/** Bản lưu lại của một CaptureShot trên GatePass — giữ nguyên trạng để người vận hành xem ảnh/kết quả từng
+ *  camera khi CAPTURE_FAILED cần nhập tay biển số/loại xe/loại đá qua ResolvePanel có sẵn. */
+export interface CaptureAttempt {
+  cameraId: string;
+  plateNumber: string | null;
+  ocrConfidence: number | null;
+  detectorConfidence: number | null;
+  vehicleType: Classification | null;
+  material: Classification | null;
+  imageUrl: string | null;
+  quality: "ok" | "blurry" | "no_plate";
+}
+
 export interface GatePass {
   /** Đối chiếu với danh sách xe trong bãi (master data) và tài xế của xe đó. */
   master: MasterLink;
   id: string;
   createdAt: string;
   updatedAt: string;
+  /** null = luồng bình thường. "pending" = đã có số liệu cân, đang chờ đủ ảnh từ camera (xem GatePassesService).
+   *  "failed" = hết thời gian chờ mà không ảnh nào đọc được biển số rõ — cần người kiểm tra lại (CAPTURE_FAILED).
+   *  deriveStatus() ưu tiên đọc field này trước khi suy ra trạng thái từ checks như bình thường. */
+  captureState: "pending" | "failed" | null;
+  /** Các lần camera trả ảnh cho đợt chụp gần nhất (rỗng khi chưa từng qua luồng cân-trước-chụp-sau). */
+  captureAttempts: CaptureAttempt[];
   capture: PlateCapture;
   /** Lượt nhận diện lúc xe ra — null khi xe chưa ra, hoặc lượt này không có camera xác nhận lúc ra. */
   exitCapture: PlateCapture | null;
@@ -112,7 +154,8 @@ export interface GatePass {
 
 /**
  * Một lượt nhận diện đẩy về từ lớp Python (xem services/ai-worker trước đây, nay python/detect) qua
- * `POST /api/gate/detections`. Không còn ảnh/khung — chỉ số liệu để ghép lượt xe và chạy nghiệp vụ.
+ * `POST /api/gate/detections`. Số liệu để ghép lượt xe và chạy nghiệp vụ, kèm link ảnh bằng chứng
+ * (MinIO) nếu python/detect có cấu hình upload.
  */
 export interface DetectionInput {
   cameraId: string;
@@ -126,4 +169,6 @@ export interface DetectionInput {
   capturedAt?: string;
   /** true khi đây là lần cập nhật cuối của track này (đã đủ tin cậy để chốt). */
   final?: boolean;
+  /** Link ảnh (MinIO) đã upload sẵn ở phía python/detect; null/thiếu = không có ảnh cho lượt này. */
+  imageUrl?: string | null;
 }

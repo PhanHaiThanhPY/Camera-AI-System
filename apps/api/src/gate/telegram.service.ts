@@ -1,8 +1,5 @@
 import { BadGatewayException, BadRequestException, Injectable, Logger } from "@nestjs/common";
 import type { OnModuleDestroy, OnModuleInit } from "@nestjs/common";
-// NestJS needs the runtime class token for constructor dependency injection.
-// eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { PrismaService } from "../prisma/prisma.service";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { GatePassRepository } from "./gate-pass.repository";
 // NestJS needs the runtime class token for constructor dependency injection.
@@ -11,24 +8,19 @@ import { AssistantService } from "./assistant.service";
 import { buildReport, toPlainText } from "./telegram.report";
 import type { BuiltReport } from "./telegram.report";
 
-const TELEGRAM_CONFIG_ID = "default";
-
-interface StoredConfig {
+interface EnvConfig {
   botToken: string;
-  botUsername: string;
   chatId: string;
-  chatTitle: string;
 }
 
 export interface PublicConfig {
   configured: boolean;
   hasToken: boolean;
-  tokenMasked: string | null;
   botUsername: string | null;
   chatId: string | null;
   chatTitle: string | null;
   timeZone: string;
-  /** true khi ANTHROPIC_API_KEY đã đặt trên máy chủ — trợ lý AI trong Telegram sẵn sàng trả lời câu hỏi tự do. */
+  /** true khi DEEPSEEK_API_KEY đã đặt trên máy chủ — trợ lý AI trong Telegram sẵn sàng trả lời câu hỏi tự do. */
   assistantEnabled: boolean;
 }
 
@@ -62,9 +54,11 @@ interface Update {
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Tích hợp bot Telegram: lưu token + nhóm nhận báo cáo (Postgres), gửi báo cáo ngày, và chạy vòng long-poll
- * nền để nhận tin nhắn — admin chat trực tiếp với bot, câu hỏi tự do được chuyển cho AssistantService (Claude)
- * trả lời dựa trên dữ liệu thật của hệ thống. Token không bao giờ trả về trình duyệt ngoài lúc "Hiện".
+ * Tích hợp bot Telegram: token + nhóm nhận báo cáo đọc thẳng từ biến môi trường (TELEGRAM_BOT_TOKEN/
+ * TELEGRAM_CHAT_ID) — không nhập/lưu qua giao diện hay Postgres nữa (bảo mật: credential không đi qua
+ * trình duyệt hay nằm trong DB). Gửi báo cáo ngày, và chạy vòng long-poll nền để nhận tin nhắn — admin
+ * chat trực tiếp với bot, câu hỏi tự do được chuyển cho AssistantService (DeepSeek) trả lời dựa trên dữ
+ * liệu thật của hệ thống.
  */
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -77,11 +71,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     .filter((id) => id !== "");
   /** Nhóm/chat bot đã nhìn thấy qua vòng long-poll — thay cho việc gọi getUpdates riêng mỗi lần bấm "Tìm nhóm". */
   private readonly seenChats = new Map<string, TelegramChat>();
+  /** @username của bot, lấy 1 lần qua getMe rồi nhớ trong tiến trình — chỉ hiển thị, không phải credential. */
+  private botUsername: string | null = null;
   private offset = 0;
   private stopped = false;
 
   public constructor(
-    private readonly prisma: PrismaService,
     private readonly passes: GatePassRepository,
     private readonly assistant: AssistantService
   ) {}
@@ -95,54 +90,26 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   public async getConfig(): Promise<PublicConfig> {
-    const config = await this.loadConfig();
+    const config = this.envConfig();
+    if (config.botToken !== "" && this.botUsername === null) {
+      this.botUsername = await this.call<{ username?: string }>(config.botToken, "getMe")
+        .then((me) => me.username ?? null)
+        .catch(() => null);
+    }
     return {
       configured: config.botToken !== "" && config.chatId !== "",
       hasToken: config.botToken !== "",
-      tokenMasked: config.botToken === "" ? null : `${config.botToken.slice(0, 4)}…${config.botToken.slice(-4)}`,
-      botUsername: config.botUsername === "" ? null : config.botUsername,
+      botUsername: this.botUsername,
       chatId: config.chatId === "" ? null : config.chatId,
-      chatTitle: config.chatTitle === "" ? null : config.chatTitle,
+      chatTitle: config.chatId === "" ? null : (this.seenChats.get(config.chatId)?.title ?? null),
       timeZone: this.timeZone,
       assistantEnabled: this.assistant.configured
     };
   }
 
-  /** Lưu token (kiểm tra bằng getMe) và/hoặc nhóm nhận báo cáo. */
-  public async saveConfig(input: { botToken?: string; chatId?: string; chatTitle?: string }): Promise<PublicConfig> {
-    const current = await this.loadConfig();
-    const next: StoredConfig = { ...current };
-    if (input.botToken !== undefined && input.botToken !== "") {
-      const token = input.botToken.trim();
-      if (!/^\d+:[\w-]{20,}$/.test(token)) {
-        throw new BadRequestException("Token không đúng định dạng (dạng 123456789:AAxxxx...). Lấy từ @BotFather.");
-      }
-      const me = await this.call<{ username?: string }>(token, "getMe");
-      next.botToken = token;
-      next.botUsername = me.username ?? "";
-    }
-    if (input.chatId !== undefined) {
-      next.chatId = input.chatId.trim();
-      next.chatTitle = input.chatTitle?.trim() ?? "";
-    }
-    await this.saveStoredConfig(next);
-    return this.getConfig();
-  }
-
-  /** Trả token đã lưu để người dùng xem lại khi bấm "Hiện". Chỉ gọi theo yêu cầu, không nằm trong cấu hình thường. */
-  public async revealToken(): Promise<{ botToken: string }> {
-    const config = await this.loadConfig();
-    return { botToken: config.botToken };
-  }
-
-  public async clearConfig(): Promise<PublicConfig> {
-    await this.saveStoredConfig({ botToken: "", botUsername: "", chatId: "", chatTitle: "" });
-    return this.getConfig();
-  }
-
-  /** Nhóm/chat bot đã nhìn thấy (sau khi bạn add bot vào nhóm và gửi một tin nhắn, hoặc đã nhắn riêng cho bot). */
+  /** Nhóm/chat bot đã nhìn thấy (sau khi bạn add bot vào nhóm và gửi một tin nhắn) — chỉ để tra Chat ID dán vào .env. */
   public async discoverChats(): Promise<TelegramChat[]> {
-    const token = await this.requireToken();
+    const token = this.requireToken();
     // Đồng bộ ngay một nhịp (không chờ lâu) để gộp tin vừa tới trước khi trả về, dùng chung offset với vòng poll nền.
     await this.pollOnce(token, 0);
     return [...this.seenChats.values()];
@@ -151,8 +118,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   /** Vòng long-poll nền: chờ token được cấu hình, rồi liên tục getUpdates để nhận tin nhắn admin gửi cho bot. */
   private async pollLoop(): Promise<void> {
     while (!this.stopped) {
-      const config = await this.loadConfig().catch(() => null);
-      if (config === null || config.botToken === "") {
+      const config = this.envConfig();
+      if (config.botToken === "") {
         await delay(3_000);
         continue;
       }
@@ -243,40 +210,29 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async sendMessages(messages: string[]): Promise<void> {
-    const token = await this.requireToken();
-    const config = await this.loadConfig();
+    const token = this.requireToken();
+    const config = this.envConfig();
     if (config.chatId === "") {
-      throw new BadRequestException("Chưa chọn nhóm nhận báo cáo.");
+      throw new BadRequestException("Chưa đặt TELEGRAM_CHAT_ID trên máy chủ.");
     }
     for (const text of messages) {
       await this.call(token, "sendMessage", { chat_id: config.chatId, text, parse_mode: "HTML", disable_web_page_preview: true });
     }
   }
 
-  private async requireToken(): Promise<string> {
-    const config = await this.loadConfig();
-    if (config.botToken === "") {
-      throw new BadRequestException("Chưa cài token bot Telegram.");
+  private requireToken(): string {
+    const { botToken } = this.envConfig();
+    if (botToken === "") {
+      throw new BadRequestException("Chưa đặt TELEGRAM_BOT_TOKEN trên máy chủ.");
     }
-    return config.botToken;
+    return botToken;
   }
 
-  private async loadConfig(): Promise<StoredConfig> {
-    const row = await this.prisma.telegramConfig.findUnique({ where: { id: TELEGRAM_CONFIG_ID } });
+  private envConfig(): EnvConfig {
     return {
-      botToken: process.env.TELEGRAM_BOT_TOKEN ?? row?.botToken ?? "",
-      botUsername: row?.botUsername ?? "",
-      chatId: process.env.TELEGRAM_CHAT_ID ?? row?.chatId ?? "",
-      chatTitle: row?.chatTitle ?? ""
+      botToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+      chatId: process.env.TELEGRAM_CHAT_ID ?? ""
     };
-  }
-
-  private async saveStoredConfig(config: StoredConfig): Promise<void> {
-    await this.prisma.telegramConfig.upsert({
-      where: { id: TELEGRAM_CONFIG_ID },
-      create: { id: TELEGRAM_CONFIG_ID, ...config },
-      update: config
-    });
   }
 
   private async call<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {

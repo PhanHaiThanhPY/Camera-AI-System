@@ -1,10 +1,30 @@
-import { ReactElement, useState } from "react";
+import { MouseEvent, ReactElement, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { STATUS_LABELS, VISIT_LABELS, formatKg, formatTime, request, useGateCatalog, weighLegs } from "./PassDetail";
+import { Lightbox, STATUS_LABELS, VISIT_LABELS, formatKg, formatTime, request, useGateCatalog, useLightbox, weighLegs } from "./PassDetail";
 import type { Catalog, GatePass } from "./PassDetail";
 
 const labelOf = (items: Catalog["vehicleTypes"] | undefined, code: string | null): string =>
   code === null ? "—" : (items?.find((item) => item.code === code)?.label ?? code);
+
+/** `onOpen` phóng to ảnh qua lightbox — bấm ảnh KHÔNG được mở luôn trang chi tiết của cả dòng nên cần
+ *  stopPropagation (dòng cũng có onClick mở trang chi tiết — xem bảng bên dưới). */
+function captureImages(row: GatePass, onOpen: (url: string) => void): ReactElement {
+  const entryUrl = row.capture.imageUrl;
+  const exitUrl = row.exitCapture?.imageUrl ?? null;
+  if (entryUrl === null && exitUrl === null) {
+    return <span className="muted-text">—</span>;
+  }
+  const open = (event: MouseEvent, url: string): void => {
+    event.stopPropagation();
+    onOpen(url);
+  };
+  return (
+    <div className="capture-thumb-row">
+      {entryUrl !== null && <button className="capture-thumb" onClick={(event) => open(event, entryUrl)} title="Ảnh lúc vào" type="button"><img alt="Ảnh lúc vào" loading="lazy" src={entryUrl} /></button>}
+      {exitUrl !== null && <button className="capture-thumb" onClick={(event) => open(event, exitUrl)} title="Ảnh lúc ra" type="button"><img alt="Ảnh lúc ra" loading="lazy" src={exitUrl} /></button>}
+    </div>
+  );
+}
 
 function driverText(row: GatePass): ReactElement | string {
   if (row.master.match === "none") {
@@ -33,14 +53,6 @@ function localDate(value: string): string {
 const CSV_HEADERS = [
   "Thời gian chụp", "Biển số", "Ra/Vào", "Tài xế", "Loại xe", "Loại đá",
   "Cân đầu vào (kg)", "Cân đầu ra (kg)", "Đá net (kg)", "Trạng thái", "Lý do"
-];
-
-const SAMPLE_TICKETS = [
-  { ticket: "MD-014", site: "Mỏ đá", material: "Đá 2–3", grossKg: 38_760, tareKg: 12_480, netKg: 26_280 },
-  { ticket: "MC-008", site: "Mỏ cát", material: "Cát", grossKg: 36_000, tareKg: 12_000, netKg: 24_000 },
-  { ticket: "BT-006", site: "Cơ sở bê tông", material: "Đá 4–6", grossKg: 39_000, tareKg: 12_500, netKg: 26_500 },
-  { ticket: "MC-001", site: "Mỏ đá", material: "Đá 2–3", grossKg: 38_760, tareKg: 12_480, netKg: 26_280 },
-  { ticket: "MC-002", site: "Mỏ đá", material: "Đá 2–3", grossKg: 38_760, tareKg: 12_480, netKg: 26_280 }
 ];
 
 interface ClearResult {
@@ -86,60 +98,14 @@ function exportCsv(rows: GatePass[], catalog: Catalog | undefined): void {
   URL.revokeObjectURL(url);
 }
 
-function exportSampleTicketsCsv(): void {
-  const lines = [["Phiếu", "Cơ sở", "Vật liệu", "Tổng (kg)", "Bì (kg)", "Hàng (kg)", "Đồng bộ"].join(",")];
-  for (const row of SAMPLE_TICKETS) {
-    lines.push([row.ticket, row.site, row.material, row.grossKg, row.tareKg, row.netKg, "Đã đồng bộ"].map((value) => csvCell(String(value))).join(","));
-  }
-  const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "so-can-truy-vet_mo-phong.csv";
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-/** Sổ cân rút gọn theo đúng bố cục proposal: một dòng một phiếu, không có ảnh. "Đồng bộ" suy từ quyết định — chưa có kênh đồng bộ thật. */
-function SummarySheet(): ReactElement {
-  return (
-    <div className="sheet-wrap">
-      <table className="sheet compact">
-        <thead>
-          <tr>
-            <th>Phiếu</th>
-            <th>Cơ sở</th>
-            <th>Vật liệu</th>
-            <th>Tổng (kg)</th>
-            <th>Bì (kg)</th>
-            <th>Hàng (kg)</th>
-            <th>Đồng bộ</th>
-          </tr>
-        </thead>
-        <tbody>
-          {SAMPLE_TICKETS.map((row) => (
-            <tr key={row.ticket}>
-              <td className="cell-plate">{row.ticket}</td>
-              <td>{row.site}</td>
-              <td>{row.material}</td>
-              <td className="cell-num">{row.grossKg.toLocaleString("vi-VN")}</td>
-              <td className="cell-num">{row.tareKg.toLocaleString("vi-VN")}</td>
-              <td className="cell-num"><strong>{row.netKg.toLocaleString("vi-VN")}</strong></td>
-              <td><span className="status-pill gate-verified">Đã đồng bộ</span></td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-/** Sổ cân & truy vết: tóm tắt theo bố cục proposal, hoặc bảng đầy đủ mọi cột số liệu của lượt xe. */
-export default function CapturesTable(): ReactElement {
+/** Sổ cân & truy vết: bảng đầy đủ mọi cột số liệu + ảnh bằng chứng của lượt xe, lấy thẳng từ API. Bấm vào
+ *  một dòng để mở trang chi tiết riêng (PassPage.tsx, qua App.tsx) — sửa/xác nhận/từ chối làm ở đó, to rõ
+ *  hơn hẳn popup cũ. Trạm cân trực tiếp (LivePage) chỉ xem, không sửa được ở đó nữa. */
+export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string) => void }): ReactElement {
   const catalog = useGateCatalog();
   const passesQuery = useQuery({ queryKey: ["gate-passes-table"], queryFn: () => request<GatePass[]>("/passes"), refetchInterval: 3000 });
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<"summary" | "full">("summary");
+  const lightbox = useLightbox();
   const [clearMessage, setClearMessage] = useState<string | null>(null);
   const clear = useMutation({
     mutationFn: (scope: "resolved" | "all") => request<ClearResult>(`/passes?scope=${scope}`, { method: "DELETE" }),
@@ -167,13 +133,9 @@ export default function CapturesTable(): ReactElement {
   const resolvedCount = allRows.filter((row) => row.resolution !== "PENDING").length;
 
   return (
-    <section className={`panel captures-page ${tab === "summary" ? "captures-summary" : "captures-full"}`}>
+    <section className="panel captures-page captures-full">
       <div className="panel-heading">
         <div><h2>Sổ cân theo chuyến xe</h2><p className="muted-text captures-description">Dữ liệu minh họa. Phiếu mới được thêm sau khi chốt mô phỏng.</p></div>
-      </div>
-      <div className="view-tabs captures-extra">
-        <button aria-pressed={tab === "summary"} className="tab-button" type="button" onClick={() => setTab("summary")}>Tóm tắt</button>
-        <button aria-pressed={tab === "full"} className="tab-button" type="button" onClick={() => setTab("full")}>Đầy đủ &amp; ảnh</button>
       </div>
       <div className="sheet-filter captures-extra">
         <label>Từ ngày<input max={toDate || undefined} type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} /></label>
@@ -192,13 +154,7 @@ export default function CapturesTable(): ReactElement {
         </button>
       </div>
       {clearMessage !== null && <p className="muted-text">{clearMessage}</p>}
-      {tab === "summary" ? (
-        <>
-          <SummarySheet />
-          <div className="summary-export"><button className="primary-button" type="button" onClick={exportSampleTicketsCsv}>Xuất CSV</button><span className="muted-text">5 phiếu trong bộ dữ liệu</span></div>
-          <p className="sim-banner">Phiếu lưu theo mã chuyến duy nhất. Chốt lặp không tạo bản ghi trùng. Lịch sử điều chỉnh giữ nội dung gốc và lý do.</p>
-        </>
-      ) : rows.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="empty-state">
           <span className="empty-icon">◌</span>
           <h3>{filtered ? "Không có lượt nào trong khoảng ngày đã chọn" : "Chưa có lượt xe"}</h3>
@@ -221,13 +177,14 @@ export default function CapturesTable(): ReactElement {
                 <th>Đá (net)</th>
                 <th>Trạng thái</th>
                 <th>Lý do</th>
+                <th>Ảnh</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((row, index) => {
                 const legs = weighLegs(row.weighing);
                 return (
-                  <tr key={row.id}>
+                  <tr className="clickable" key={row.id} onClick={() => onOpenPass(row.id)}>
                     <td className="cell-num">{rows.length - index}</td>
                     <td className="cell-nowrap">{formatTime(row.capture.capturedAt)}</td>
                     <td className="cell-plate">{row.effective.plateNumber}</td>
@@ -240,6 +197,7 @@ export default function CapturesTable(): ReactElement {
                     <td className="cell-num">{formatKg(row.weighing?.netKg ?? null)}</td>
                     <td><span className={`status-pill gate-${row.status.toLowerCase()}`}>{STATUS_LABELS[row.status]}</span></td>
                     <td className="cell-reasons">{row.statusReasons.length === 0 ? "—" : row.statusReasons.map((reason) => <div key={reason}>{reason}</div>)}</td>
+                    <td>{captureImages(row, lightbox.open)}</td>
                   </tr>
                 );
               })}
@@ -247,6 +205,7 @@ export default function CapturesTable(): ReactElement {
           </table>
         </div>
       )}
+      <Lightbox url={lightbox.openUrl} onClose={lightbox.close} />
     </section>
   );
 }

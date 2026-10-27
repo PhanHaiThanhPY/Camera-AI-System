@@ -1,10 +1,18 @@
-"""Nhận diện biển số thật từ video hoặc luồng camera (RTSP), theo dõi từng xe và đẩy kết quả.
+"""Chụp 1 camera theo tín hiệu cân: cân xong mới chụp, chụp xong mới nhận diện.
 
-Luồng: YOLO phát hiện biển số → RapidOCR đọc ký tự → gom theo xe (track) → chọn khung hình tốt
-nhất để phân loại loại xe (COCO) và loại vật liệu (model huấn luyện riêng, hoặc CLIP zero-shot
-tạm thời). Không lưu ảnh/khung — chỉ số liệu. Mỗi lượt xác nhận được in ra stdout dạng JSON một
-dòng; nếu đặt GATE_API_URL, lượt đó cũng được đẩy thẳng tới `POST {GATE_API_URL}/gate/detections`
-(xem apps/api/src/gate/gate.controller.ts).
+Mỗi tiến trình (= 1 camera) giữ một kết nối video/RTSP sống (grab() liên tục, rẻ, không decode —
+để luồng luôn "tươi" và chịu được reconnect như RTSP thật cần), đồng thời polling định kỳ
+`GET {GATE_API_URL}/gate/capture-requests/pending?scaleId=...` để biết trạm cân của mình vừa
+cân xong chưa. Có đợt chờ đang mở: lấy khung hình HIỆN TẠI (retrieve()), chạy YOLO biển số +
+RapidOCR + model xe/vật liệu một lần trên đúng khung đó (xe đang đứng yên trên cân nên khung này
+thường nét hơn một khung bất kỳ giữa lúc xe chạy), rồi POST kết quả tới
+`{GATE_API_URL}/gate/passes/{passId}/capture-result` (xem apps/api/src/gate/gate.controller.ts).
+Ảnh mờ (Laplacian variance dưới CAPTURE_BLUR_MIN_VARIANCE) hoặc không thấy biển số thì vẫn báo
+kết quả nhưng đánh `quality` tương ứng để apps/api biết — đủ 4 camera (hoặc hết giờ chờ) mà không
+camera nào đọc được biển thì lượt xe chuyển trạng thái "cần kiểm tra lại" (CAPTURE_FAILED).
+
+Bản cũ chạy liên tục suốt video (xem git history) đã bỏ hẳn theo đúng luồng nghiệp vụ mới — không
+còn tracking/bình chọn biển số qua nhiều khung hình, vì mỗi lần cân chỉ chụp đúng một khung.
 
 `<input>` là đường dẫn file video hoặc URL luồng (rtsp://, http://...) — cv2.VideoCapture nhận cả
 hai như nhau, nên script này chạy được cho cả file test lẫn camera sống không cần sửa gì thêm.
@@ -13,15 +21,20 @@ hai như nhau, nên script này chạy được cho cả file test lẫn camera 
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import signal
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
-from collections import defaultdict
-from dataclasses import dataclass, field
+
+# Phải đặt TRƯỚC khi cv2 mở bất kỳ luồng RTSP nào — giống python/streamsim/server.py: một số server RTSP
+# (và cv2/FFmpeg mặc định có thể chọn UDP) sẽ treo tới khi hết timeout mở luồng (thường ~30s) rồi mới báo
+# lỗi thay vì kết nối. Đặt STREAMSIM_RTSP_TRANSPORT=udp nếu server của bạn ngược lại chỉ nhận UDP. Không
+# ảnh hưởng nguồn http/https/file.
+if "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{os.environ.get('STREAMSIM_RTSP_TRANSPORT', 'tcp')}"
 from pathlib import Path
 from typing import Any
 
@@ -129,14 +142,6 @@ def clamp_box(box: tuple[float, float, float, float], frame_size: tuple[int, int
     )
 
 
-def iou(first: Box, second: Box) -> float:
-    ix1, iy1 = max(first[0], second[0]), max(first[1], second[1])
-    ix2, iy2 = min(first[2], second[2]), min(first[3], second[3])
-    inter = max(ix2 - ix1, 0) * max(iy2 - iy1, 0)
-    union = (first[2] - first[0]) * (first[3] - first[1]) + (second[2] - second[0]) * (second[3] - second[1]) - inter
-    return inter / union if union > 0 else 0.0
-
-
 def estimate_vehicle_box(plate_box: Box, frame_size: tuple[int, int]) -> Box:
     """Dự phòng khi model xe không thấy xe: ước lượng từ biển (biển ≈ 1/5 thân xe, nằm gần đáy xe)."""
     x1, y1, x2, y2 = plate_box
@@ -213,65 +218,11 @@ class MaterialClassifier:
         return {"code": code, "confidence": confidence, "source": "zero-shot", "notCargo": False}
 
 
-# --- Track -----------------------------------------------------------------------------------
-
-
-@dataclass
-class Observation:
-    seconds: float
-    box: Box
-    text: str
-    ocr: float
-    det: float
-
-    @property
-    def valid(self) -> bool:
-        return bool(PLATE_PATTERN.match(self.text))
-
-    @property
-    def score(self) -> float:
-        area = max((self.box[2] - self.box[0]) * (self.box[3] - self.box[1]), 1)
-        return self.ocr * self.det * math.sqrt(area)
-
-
-@dataclass
-class Track:
-    track_id: int
-    observations: list[Observation] = field(default_factory=list)
-    trail: list[Observation] = field(default_factory=list)
-    best_frame: Any = None
-    best: Observation | None = None
-    emitted: int = 0
-
-    @property
-    def last(self) -> Observation:
-        return self.trail[-1]
-
-    def valid_observations(self) -> list[Observation]:
-        return [o for o in self.observations if o.valid]
-
-    def vote(self) -> str:
-        weights: dict[str, float] = defaultdict(float)
-        for obs in self.valid_observations():
-            weights[obs.text] += obs.ocr * obs.det
-        return max(weights, key=weights.get) if weights else ""  # type: ignore[arg-type]
-
-    def confirmed(self, min_ocr: float, min_detector: float) -> bool:
-        valid = self.valid_observations()
-        text = self.vote()
-        agreeing = [o for o in valid if o.text == text]
-        return len(agreeing) >= 2 or any(o.ocr >= max(min_ocr, 0.9) and o.det >= min_detector for o in agreeing)
-
-    def add(self, obs: Observation, frame: Any) -> None:
-        self.trail.append(obs)
-        if obs.valid:
-            self.observations.append(obs)
-            if self.best is None or obs.score > self.best.score:
-                self.best, self.best_frame = obs, frame.copy()
+# --- Pipeline: chờ tín hiệu cân rồi chụp 1 lần -----------------------------------------------
 
 
 class Pipeline:
-    def __init__(self, camera_id: str) -> None:
+    def __init__(self, camera_id: str, scale_id: str) -> None:
         import cv2
         from ultralytics import YOLO
 
@@ -280,8 +231,15 @@ class Pipeline:
         except ImportError:
             from rapidocr_onnxruntime import RapidOCR
 
+        from storage import ImageUploader
+
         self.cv2 = cv2
         self.camera_id = camera_id
+        self.scale_id = scale_id
+        self.storage = ImageUploader()
+        self.api_base = os.getenv("GATE_API_URL", "").strip().rstrip("/")
+        if self.api_base == "":
+            raise RuntimeError("Cần đặt GATE_API_URL — mode chụp theo tín hiệu cân phải polling apps/api để biết lúc nào cần chụp.")
 
         plate_model = resolve_path(os.getenv("LPR_MODEL_PATH", "python/models/license-plate-detector.pt"))
         if not plate_model.exists():
@@ -303,43 +261,37 @@ class Pipeline:
         self.min_detector = env_float("LPR_MIN_DETECTOR_CONF", 0.4)
         self.imgsz = int(env_float("LPR_IMGSZ", 1280))
         self.min_ocr = env_float("LPR_MIN_OCR", 0.5)
-        self.timeout = env_float("LPR_TRACK_TIMEOUT", 1.5)
         self.load_fraction = env_float("LOAD_REGION_TOP_FRACTION", 0.5)
-        self.active: list[Track] = []
-        self.next_id = 1
+        # Mỗi bao nhiêu giây hỏi apps/api xem trạm cân của mình vừa cân xong chưa (rẻ, chỉ 1 request JSON nhỏ).
+        self.poll_seconds = env_float("CAPTURE_POLL_SECONDS", 1.0)
+        # Laplacian variance dưới ngưỡng này coi là ảnh mờ (quality="blurry"), dù có đọc được chữ hay không.
+        self.blur_min_variance = env_float("CAPTURE_BLUR_MIN_VARIANCE", 60.0)
 
-    # Gán quan sát cho track đang hoạt động theo vị trí; xe vào lại cùng biển trong vài giây thì nối vào track cũ.
-    def assign(self, obs: Observation) -> Track | None:
-        best: tuple[float, Track] | None = None
-        for track in self.active:
-            if obs.seconds - track.last.seconds > self.timeout:
-                continue
-            overlap = iou(track.last.box, obs.box)
-            width = max(obs.box[2] - obs.box[0], 1)
-            cx, cy = (obs.box[0] + obs.box[2]) / 2, (obs.box[1] + obs.box[3]) / 2
-            lx, ly = (track.last.box[0] + track.last.box[2]) / 2, (track.last.box[1] + track.last.box[3]) / 2
-            distance = math.hypot(cx - lx, cy - ly) / width
-            closeness = overlap if overlap > 0.05 else (1.0 - distance / 2.5 if distance < 2.5 else 0.0)
-            if closeness > 0 and (best is None or closeness > best[0]):
-                best = (closeness, track)
-        if best is not None:
-            return best[1]
-        if obs.valid:
-            for track in self.active:
-                if track.vote() == obs.text and obs.seconds - track.last.seconds <= 6.0:
-                    return track
-        return None
+    def capture_once(self, frame: Any, size: tuple[int, int]) -> dict[str, Any]:
+        """Chạy nhận diện MỘT LẦN trên khung hình hiện tại lúc có tín hiệu chụp — không tracking/bình chọn
+        qua nhiều khung hình như bản continuous cũ, vì xe đứng yên trên cân nên một khung đã đủ để đọc."""
+        best: tuple[float, Box, str, float, float] | None = None  # score, box, text, ocr, det
+        result = self.plate_detector(frame, conf=self.confidence, imgsz=self.imgsz, verbose=False)[0]
+        if result.boxes is not None:
+            for coordinates, det in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist()):
+                box = clamp_box(tuple(coordinates), size)  # type: ignore[arg-type]
+                if box[2] - box[0] < 12 or box[3] - box[1] < 6:
+                    continue
+                text, ocr = ocr_plate(self.cv2, self.ocr, frame, box)
+                if not PLATE_PATTERN.match(text):
+                    continue
+                score = ocr * float(det)
+                if best is None or score > best[0]:
+                    best = (score, box, text, ocr, float(det))
 
-    def build_detection(self, track: Track, size: tuple[int, int], final: bool) -> dict[str, Any] | None:
-        best, frame = track.best, track.best_frame
-        text = track.vote()
-        if best is None or frame is None or not text:
-            return None
-        # Khung hình tốt nhất theo đúng biển số đã bình chọn.
-        agreeing = [o for o in track.valid_observations() if o.text == text]
-        best = max(agreeing, key=lambda o: o.score)
-        plate_box = best.box
+        # Luôn chụp + lưu ảnh làm bằng chứng, kể cả khi không đọc được biển — người vận hành cần ảnh thật để
+        # kiểm tra lại tay (xem có đúng là mờ/che khuất không, hay model bỏ sót một biển số đọc được bằng mắt).
+        if best is None:
+            # Không thấy biển số nào trong khung — chụp cả khung làm bằng chứng, không có vùng xe để khoanh riêng.
+            image_url = self.capture_image(frame, (0, 0, size[0], size[1]))
+            return {"cameraId": self.camera_id, "plateNumber": None, "ocrConfidence": None, "detectorConfidence": None, "imageUrl": image_url, "quality": "no_plate"}
 
+        _, plate_box, text, ocr_score, det_score = best
         vehicle = detect_vehicle(self.vehicle_detector, frame, plate_box)
         if vehicle is not None:
             vehicle_box, vehicle_code, vehicle_conf = vehicle
@@ -347,6 +299,19 @@ class Pipeline:
         else:
             vehicle_box = estimate_vehicle_box(plate_box, size)
             vehicle_type = {"code": None, "confidence": None, "source": "unavailable"}
+        image_url = self.capture_image(frame, vehicle_box)
+
+        if ocr_score < self.min_ocr or det_score < self.min_detector:
+            return {"cameraId": self.camera_id, "plateNumber": None, "ocrConfidence": round(ocr_score, 4), "detectorConfidence": round(det_score, 4), "imageUrl": image_url, "quality": "no_plate"}
+        if self._is_blurry(frame, plate_box):
+            return {
+                "cameraId": self.camera_id,
+                "plateNumber": format_plate(text),
+                "ocrConfidence": round(ocr_score, 4),
+                "detectorConfidence": round(det_score, 4),
+                "imageUrl": image_url,
+                "quality": "blurry",
+            }
 
         # Chỉ xe tải mới có thùng hàng để phân loại vật liệu.
         material: dict[str, Any] = {"code": None, "confidence": None, "source": "unavailable"}
@@ -364,96 +329,99 @@ class Pipeline:
                 if not verdict["notCargo"]:
                     material = {k: verdict[k] for k in ("code", "confidence", "source")}
 
-        track.emitted = track.emitted + 1
         return {
             "cameraId": self.camera_id,
-            "trackId": f"t{track.track_id}",
             "plateNumber": format_plate(text),
-            "ocrConfidence": round(best.ocr, 4),
-            "detectorConfidence": round(best.det, 4),
+            "ocrConfidence": round(ocr_score, 4),
+            "detectorConfidence": round(det_score, 4),
             "vehicleType": vehicle_type,
             "material": material,
-            "final": final,
+            "imageUrl": image_url,
+            "quality": "ok",
         }
 
-    def emit(self, detection: dict[str, Any]) -> None:
-        print(json.dumps(detection), flush=True)
-        push_detection(detection)
+    def _is_blurry(self, frame: Any, plate_box: Box) -> bool:
+        x1, y1, x2, y2 = plate_box
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return False
+        gray = self.cv2.cvtColor(crop, self.cv2.COLOR_BGR2GRAY)
+        variance = self.cv2.Laplacian(gray, self.cv2.CV_64F).var()
+        return bool(variance < self.blur_min_variance)
 
-    def finalize(self, track: Track, size: tuple[int, int]) -> None:
-        if track in self.active:
-            self.active.remove(track)
-        if not track.confirmed(self.min_ocr, self.min_detector):
-            return
-        detection = self.build_detection(track, size, final=True)
-        if detection is not None:
-            self.emit(detection)
+    def capture_image(self, frame: Any, vehicle_box: Box) -> str | None:
+        """Cắt khung hình quanh vùng xe (có đệm) rồi upload lên MinIO làm ảnh bằng chứng."""
+        if not self.storage.enabled:
+            return None
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = vehicle_box
+        pad_x, pad_y = int((x2 - x1) * 0.15), int((y2 - y1) * 0.15)
+        crop = frame[max(y1 - pad_y, 0) : min(y2 + pad_y, height), max(x1 - pad_x, 0) : min(x2 + pad_x, width)]
+        if crop.size == 0:
+            crop = frame
+        ok, buffer = self.cv2.imencode(".jpg", crop, [int(self.cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return None
+        return self.storage.upload_jpeg(self.camera_id, "capture", buffer.tobytes())
 
     def run(self, source: str) -> None:
         cv2 = self.cv2
-        capture = cv2.VideoCapture(source)
+        capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        open_timeout_msec = env_float("LPR_CAPTURE_TIMEOUT_MSEC", 8000)
+        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_msec)
+        capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, open_timeout_msec)
         if not capture.isOpened():
             raise RuntimeError(f"Không mở được nguồn video/luồng: {source}")
         fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
         size = (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        step = max(int(round(fps * env_float("LPR_SAMPLE_SECONDS", 0.5))), 1)
+        # grab() liên tục mỗi khung (rẻ, không decode) để giữ luồng tươi/chịu reconnect; chỉ retrieve()+chạy
+        # AI khi polling thấy có tín hiệu cân — đúng ý "không chạy AI liên tục suốt lúc xe chưa lên cân".
+        poll_every = max(int(round(fps * self.poll_seconds)), 1)
         frame_index = 0
 
         try:
             while not STOP_REQUESTED:
                 if not capture.grab():
                     break
-                if frame_index % step == 0:
-                    success, frame = capture.retrieve()
-                    if success:
-                        self.process_frame(frame, frame_index, fps, size)
+                if frame_index % poll_every == 0:
+                    pending = fetch_pending_capture(self.api_base, self.scale_id)
+                    if pending is not None:
+                        success, frame = capture.retrieve()
+                        if success:
+                            shot = self.capture_once(frame, size)
+                            print(json.dumps({"passId": pending["passId"], **shot}), flush=True)
+                            push_capture_result(self.api_base, str(pending["passId"]), shot)
                 frame_index += 1
         finally:
             capture.release()
-        for track in list(self.active):
-            self.finalize(track, size)
-
-    def process_frame(self, frame: Any, frame_index: int, fps: float, size: tuple[int, int]) -> None:
-        seconds = frame_index / max(fps, 1.0)
-        for track in list(self.active):
-            if seconds - track.last.seconds > self.timeout:
-                self.finalize(track, size)
-
-        result = self.plate_detector(frame, conf=self.confidence, imgsz=self.imgsz, verbose=False)[0]
-        if result.boxes is None:
-            return
-        for coordinates, det in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist()):
-            box = clamp_box(tuple(coordinates), size)  # type: ignore[arg-type]
-            if box[2] - box[0] < 12 or box[3] - box[1] < 6:
-                continue
-            text, ocr = ocr_plate(self.cv2, self.ocr, frame, box)
-            obs = Observation(seconds, box, text if ocr >= self.min_ocr else "", ocr, float(det))
-            track = self.assign(obs)
-            if track is None:
-                if not obs.valid:
-                    continue
-                track = Track(self.next_id)
-                self.next_id += 1
-                self.active.append(track)
-            track.add(obs, frame)
-            if track.emitted == 0 and track.confirmed(self.min_ocr, self.min_detector):
-                detection = self.build_detection(track, size, final=False)
-                if detection is not None:
-                    self.emit(detection)
 
 
-def push_detection(detection: dict[str, Any]) -> None:
-    """Đẩy một lượt nhận diện tới NestJS API; bỏ qua nếu chưa cấu hình GATE_API_URL (chỉ in ra stdout)."""
-    base_url = os.getenv("GATE_API_URL", "").strip().rstrip("/")
-    if base_url == "":
-        return
-    body = json.dumps(detection).encode("utf-8")
-    request = urllib.request.Request(f"{base_url}/gate/detections", data=body, headers={"Content-Type": "application/json"}, method="POST")
+def fetch_pending_capture(base_url: str, scale_id: str) -> dict[str, Any] | None:
+    """GET /gate/capture-requests/pending — trả về {"passId", "deadlineAt"} nếu trạm cân này vừa cân xong, None nếu
+    không (NestJS trả body rỗng, không phải literal "null", cho trường hợp null — xem apps/api/src/gate/gate.controller.ts)."""
+    url = f"{base_url}/gate/capture-requests/pending?scaleId={urllib.parse.quote(scale_id)}"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read()
+            if not raw:
+                return None
+            payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+        print(f"fetch_pending_capture failed: {error}", file=sys.stderr)
+        return None
+
+
+def push_capture_result(base_url: str, pass_id: str, shot: dict[str, Any]) -> None:
+    """POST /gate/passes/{passId}/capture-result — kết quả nhận diện 1 khung hình cho đợt chụp đang mở."""
+    body = json.dumps(shot).encode("utf-8")
+    request = urllib.request.Request(f"{base_url}/gate/passes/{pass_id}/capture-result", data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             response.read()
     except (urllib.error.URLError, OSError) as error:
-        print(f"push_detection failed: {error}", file=sys.stderr)
+        print(f"push_capture_result failed: {error}", file=sys.stderr)
 
 
 def main() -> None:
@@ -461,7 +429,8 @@ def main() -> None:
         raise ValueError("Usage: pipeline.py <video_path_or_stream_url> [camera_id]")
     source = sys.argv[1]
     camera_id = sys.argv[2] if len(sys.argv) >= 3 else "cam-01"
-    Pipeline(camera_id).run(source)
+    scale_id = os.getenv("CAPTURE_SCALE_ID", "SCALE-01")
+    Pipeline(camera_id, scale_id).run(source)
 
 
 if __name__ == "__main__":

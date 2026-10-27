@@ -54,12 +54,14 @@ model GatePass {
   capturedAt      DateTime
   plateNormalized String
 
-  /// "NOT_IN_YARD" | "WAITING_WEIGHT" | "WAITING_SECOND_WEIGH" | "VERIFIED" | "REVIEW_REQUIRED" | "MISMATCH"
+  /// "NOT_IN_YARD" | "WAITING_CAPTURE" | "WAITING_WEIGHT" | "WAITING_SECOND_WEIGH" | "VERIFIED" | "REVIEW_REQUIRED" | "MISMATCH" | "CAPTURE_FAILED"
   status          String
   /// "ENTERED" | "EXITED"
   visitStatus     String
   /// "PENDING" | "CONFIRMED" | "REJECTED"
   resolution      String    @default("PENDING")
+  /// null | "pending" | "failed" — luồng cân-trước-chụp-sau, xem gate-passes.service.ts.
+  captureState    String?
 
   // Bằng chứng và kết quả — giữ nguyên hình dạng TypeScript, lưu JSONB.
   capture         Json
@@ -73,6 +75,8 @@ model GatePass {
   effective       Json
   master          Json
   audit           Json
+  /// CaptureAttempt[] của đợt chụp gần nhất — xem gate.types.ts.
+  captureAttempts Json      @default("[]")
 
   readings        WeighReading[]
 
@@ -99,13 +103,4 @@ model WeighReading {
 
   @@index([gatePassId])
   @@index([plateNumber])
-}
-
-/// Cấu hình bot Telegram — một dòng duy nhất (id cố định "default").
-model TelegramConfig {
-  id          String  @id @default("default")
-  botToken    String  @default("")
-  botUsername String  @default("")
-  chatId      String  @default("")
-  chatTitle   String  @default("")
 }

@@ -12,7 +12,7 @@ import {
   Query
 } from "@nestjs/common";
 import { MATERIALS, VEHICLE_PROFILES } from "./gate.catalog";
-import type { Classification, DetectionInput, GateOverrides, GatePass, WeighReading } from "./gate.types";
+import type { CaptureShot, Classification, DetectionInput, GateOverrides, GatePass, WeighReading } from "./gate.types";
 // NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { GatePassesService } from "./gate-passes.service";
@@ -128,7 +128,42 @@ function parseDetection(body: JsonBody): DetectionInput {
     vehicleType: optionalClassification(record, "vehicleType"),
     material: optionalClassification(record, "material"),
     capturedAt: capturedAt ?? undefined,
-    final: record.final === true
+    final: record.final === true,
+    imageUrl: optionalString(record, "imageUrl")
+  };
+}
+
+const SHOT_QUALITIES = ["ok", "blurry", "no_plate"] as const;
+
+/** Một camera (python/detect/pipeline.py ở mode chờ-tín-hiệu-chụp, hoặc nút "Mô phỏng cân + chụp") gửi kết
+ *  quả chụp cho POST /gate/passes/:id/capture-result — xem GatePassesService.submitCaptureResult. */
+function parseCaptureShot(body: JsonBody): CaptureShot {
+  const record = asRecord(body);
+  const cameraId = optionalString(record, "cameraId");
+  if (cameraId === null) {
+    throw new BadRequestException("cameraId là bắt buộc.");
+  }
+  const quality = record.quality;
+  if (typeof quality !== "string" || !SHOT_QUALITIES.includes(quality as (typeof SHOT_QUALITIES)[number])) {
+    throw new BadRequestException(`quality phải là một trong: ${SHOT_QUALITIES.join(", ")}.`);
+  }
+  const ocrConfidence = record.ocrConfidence;
+  const detectorConfidence = record.detectorConfidence;
+  if (ocrConfidence !== undefined && ocrConfidence !== null && typeof ocrConfidence !== "number") {
+    throw new BadRequestException("ocrConfidence phải là số.");
+  }
+  if (detectorConfidence !== undefined && detectorConfidence !== null && typeof detectorConfidence !== "number") {
+    throw new BadRequestException("detectorConfidence phải là số.");
+  }
+  return {
+    cameraId,
+    plateNumber: optionalString(record, "plateNumber"),
+    ocrConfidence: (ocrConfidence as number | null | undefined) ?? null,
+    detectorConfidence: (detectorConfidence as number | null | undefined) ?? null,
+    vehicleType: optionalClassification(record, "vehicleType"),
+    material: optionalClassification(record, "material"),
+    imageUrl: optionalString(record, "imageUrl"),
+    quality: quality as CaptureShot["quality"]
   };
 }
 
@@ -219,7 +254,8 @@ export class GateController {
     return this.gatePasses.listReadings();
   }
 
-  /** Hệ thống cân bên ngoài đẩy số liệu về đây. Đặt WEIGHBRIDGE_API_KEY để yêu cầu header X-Weighbridge-Key. */
+  /** Hệ thống cân bên ngoài đẩy số liệu về đây — ghép theo trạm cân rồi mở ngay một đợt chờ ảnh camera
+   *  (xem GatePassesService.ingestReading). Đặt WEIGHBRIDGE_API_KEY để yêu cầu header X-Weighbridge-Key. */
   @Post("weighbridge/readings")
   @HttpCode(201)
   public ingest(@Headers("x-weighbridge-key") key: string | undefined, @Body() body: JsonBody): Promise<WeighReading> {
@@ -228,5 +264,29 @@ export class GateController {
       throw new ForbiddenException("API key trạm cân không hợp lệ.");
     }
     return this.gatePasses.ingestReading(parseReading(body));
+  }
+
+  /** Mỗi tiến trình camera (python/detect/pipeline.py, 1 process = 1 camera) polling cái này để biết có cần
+   *  chụp ngay không — xem GatePassesService.findPendingCaptureByScale. */
+  @Get("capture-requests/pending")
+  public pendingCapture(@Query("scaleId") scaleId: string | undefined): Promise<{ passId: string; deadlineAt: string } | null> {
+    if (scaleId === undefined || scaleId.trim() === "") {
+      throw new BadRequestException("scaleId là bắt buộc.");
+    }
+    return this.gatePasses.findPendingCaptureByScale(scaleId.trim());
+  }
+
+  /** Một camera trả kết quả chụp cho đợt chờ ảnh đang mở của lượt xe `id`. */
+  @Post("passes/:id/capture-result")
+  @HttpCode(200)
+  public captureResult(@Param("id") id: string, @Body() body: JsonBody): Promise<GatePass> {
+    return this.gatePasses.submitCaptureResult(id, parseCaptureShot(body));
+  }
+
+  /** Demo/thử nghiệm: mô phỏng cân + chụp (nút "Mô phỏng cân + chụp" ở dashboard) — đi qua đúng luồng thật. */
+  @Post("simulate/weigh-and-capture")
+  @HttpCode(200)
+  public simulate(): Promise<GatePass> {
+    return this.gatePasses.simulateWeighAndCapture();
   }
 }

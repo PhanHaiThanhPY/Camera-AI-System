@@ -1,11 +1,14 @@
+import { randomUUID } from "node:crypto";
 import type { OnModuleInit } from "@nestjs/common";
 import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { Subject } from "rxjs";
+import { isDemoMode } from "../config/demo-mode";
 import { findVehicleProfile } from "./gate.catalog";
 import { editDistance, normalizePlate } from "./gate.verification";
 // NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { PrismaService } from "../prisma/prisma.service";
+import { DEMO_VEHICLES } from "./demo-data";
 import { NO_MASTER_LINK } from "./master.types";
 import type { Driver, MasterLink, Vehicle } from "./master.types";
 
@@ -41,6 +44,11 @@ export class MasterDataService implements OnModuleInit {
   public constructor(private readonly prisma: PrismaService) {}
 
   public async onModuleInit(): Promise<void> {
+    if (isDemoMode()) {
+      this.seedDemoMasterData();
+      this.logger.log(`DEMO_MODE=true — nạp master data mẫu: ${this.vehicles.size} xe, ${this.drivers.size} tài xế.`);
+      return;
+    }
     const [vehicles, drivers] = await Promise.all([this.prisma.vehicle.findMany(), this.prisma.driver.findMany()]);
     for (const vehicle of vehicles) {
       this.vehicles.set(vehicle.id, toDomainVehicle(vehicle));
@@ -49,6 +57,37 @@ export class MasterDataService implements OnModuleInit {
       this.drivers.set(driver.id, toDomainDriver(driver));
     }
     this.logger.log(`Đã nạp master data: ${this.vehicles.size} xe, ${this.drivers.size} tài xế.`);
+  }
+
+  /** Nạp danh sách xe/tài xế mẫu (gate/demo-data.ts) thẳng vào bộ nhớ — không qua Postgres. */
+  private seedDemoMasterData(): void {
+    for (const seed of DEMO_VEHICLES) {
+      const now = new Date().toISOString();
+      const vehicleId = randomUUID();
+      this.vehicles.set(vehicleId, {
+        id: vehicleId,
+        plateNumber: seed.plateNumber,
+        plateNormalized: normalizePlate(seed.plateNumber),
+        vehicleType: seed.vehicleType,
+        note: seed.note,
+        createdAt: now,
+        updatedAt: now
+      });
+      for (const driverSeed of seed.drivers) {
+        const driverId = randomUUID();
+        this.drivers.set(driverId, {
+          id: driverId,
+          vehicleId,
+          fullName: driverSeed.fullName,
+          phone: driverSeed.phone,
+          licenseNo: driverSeed.licenseNo,
+          note: "",
+          isPrimary: driverSeed.isPrimary,
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    }
   }
 
   public listVehicles(): (Vehicle & { drivers: Driver[] })[] {
@@ -60,10 +99,14 @@ export class MasterDataService implements OnModuleInit {
   public async createVehicle(input: VehicleInput): Promise<Vehicle> {
     const plate = this.validPlate(input.plateNumber);
     this.assertUnique(plate.normalized, null);
-    const row = await this.prisma.vehicle.create({
-      data: { plateNumber: plate.display, plateNormalized: plate.normalized, vehicleType: this.validType(input.vehicleType), note: input.note ?? "" }
-    });
-    const vehicle = toDomainVehicle(row);
+    const vehicleType = this.validType(input.vehicleType);
+    const note = input.note ?? "";
+    const now = new Date().toISOString();
+    const vehicle = isDemoMode()
+      ? { id: randomUUID(), plateNumber: plate.display, plateNormalized: plate.normalized, vehicleType, note, createdAt: now, updatedAt: now }
+      : toDomainVehicle(
+          await this.prisma.vehicle.create({ data: { plateNumber: plate.display, plateNormalized: plate.normalized, vehicleType, note } })
+        );
     this.vehicles.set(vehicle.id, vehicle);
     this.changed();
     return vehicle;
@@ -84,8 +127,9 @@ export class MasterDataService implements OnModuleInit {
     if (input.note !== undefined) {
       data.note = input.note;
     }
-    const row = await this.prisma.vehicle.update({ where: { id: current.id }, data });
-    const vehicle = toDomainVehicle(row);
+    const vehicle = isDemoMode()
+      ? { ...current, ...data, updatedAt: new Date().toISOString() }
+      : toDomainVehicle(await this.prisma.vehicle.update({ where: { id: current.id }, data }));
     this.vehicles.set(vehicle.id, vehicle);
     this.changed();
     return vehicle;
@@ -95,7 +139,9 @@ export class MasterDataService implements OnModuleInit {
   public async deleteVehicle(id: string): Promise<{ removedDrivers: number }> {
     this.getVehicle(id);
     const owned = this.driversOf(id);
-    await this.prisma.vehicle.delete({ where: { id } });
+    if (!isDemoMode()) {
+      await this.prisma.vehicle.delete({ where: { id } });
+    }
     for (const driver of owned) {
       this.drivers.delete(driver.id);
     }
@@ -112,10 +158,11 @@ export class MasterDataService implements OnModuleInit {
     }
     // Tài xế đầu tiên của xe mặc định là tài xế chính.
     const isPrimary = input.isPrimary ?? this.driversOf(vehicleId).length === 0;
-    const row = await this.prisma.driver.create({
-      data: { vehicleId, fullName, phone: input.phone ?? "", licenseNo: input.licenseNo ?? "", note: input.note ?? "", isPrimary }
-    });
-    const driver = toDomainDriver(row);
+    const data = { vehicleId, fullName, phone: input.phone ?? "", licenseNo: input.licenseNo ?? "", note: input.note ?? "", isPrimary };
+    const now = new Date().toISOString();
+    const driver = isDemoMode()
+      ? { id: randomUUID(), ...data, createdAt: now, updatedAt: now }
+      : toDomainDriver(await this.prisma.driver.create({ data }));
     this.drivers.set(driver.id, driver);
     if (driver.isPrimary) {
       await this.demoteOthers(driver);
@@ -145,8 +192,9 @@ export class MasterDataService implements OnModuleInit {
     if (input.isPrimary !== undefined) {
       data.isPrimary = input.isPrimary;
     }
-    const row = await this.prisma.driver.update({ where: { id: current.id }, data });
-    const driver = toDomainDriver(row);
+    const driver = isDemoMode()
+      ? { ...current, ...data, updatedAt: new Date().toISOString() }
+      : toDomainDriver(await this.prisma.driver.update({ where: { id: current.id }, data }));
     this.drivers.set(driver.id, driver);
     if (driver.isPrimary) {
       await this.demoteOthers(driver);
@@ -157,13 +205,17 @@ export class MasterDataService implements OnModuleInit {
 
   public async deleteDriver(id: string): Promise<void> {
     const driver = this.getDriver(id);
-    await this.prisma.driver.delete({ where: { id } });
+    if (!isDemoMode()) {
+      await this.prisma.driver.delete({ where: { id } });
+    }
     this.drivers.delete(id);
     // Xoá tài xế chính thì chuyển vai trò cho người còn lại đầu tiên.
     const rest = this.driversOf(driver.vehicleId);
     const successor = rest[0];
     if (driver.isPrimary && successor !== undefined) {
-      await this.prisma.driver.update({ where: { id: successor.id }, data: { isPrimary: true } });
+      if (!isDemoMode()) {
+        await this.prisma.driver.update({ where: { id: successor.id }, data: { isPrimary: true } });
+      }
       this.drivers.set(successor.id, { ...successor, isPrimary: true });
     }
     this.changed();
@@ -179,15 +231,15 @@ export class MasterDataService implements OnModuleInit {
         skipped += 1;
         continue;
       }
-      const row = await this.prisma.vehicle.create({
-        data: {
-          plateNumber: item.plateNumber.trim(),
-          plateNormalized: normalized,
-          vehicleType: item.vehicleType !== null && findVehicleProfile(item.vehicleType) !== undefined ? item.vehicleType : null,
-          note: "Nhập từ danh sách ảnh đã chụp"
-        }
-      });
-      this.vehicles.set(row.id, toDomainVehicle(row));
+      const data = {
+        plateNumber: item.plateNumber.trim(),
+        plateNormalized: normalized,
+        vehicleType: item.vehicleType !== null && findVehicleProfile(item.vehicleType) !== undefined ? item.vehicleType : null,
+        note: "Nhập từ danh sách ảnh đã chụp"
+      };
+      const now = new Date().toISOString();
+      const vehicle = isDemoMode() ? { id: randomUUID(), ...data, createdAt: now, updatedAt: now } : toDomainVehicle(await this.prisma.vehicle.create({ data }));
+      this.vehicles.set(vehicle.id, vehicle);
       created += 1;
     }
     if (created > 0) {
@@ -231,7 +283,9 @@ export class MasterDataService implements OnModuleInit {
   private async demoteOthers(keep: Driver): Promise<void> {
     const others = this.driversOf(keep.vehicleId).filter((driver) => driver.id !== keep.id && driver.isPrimary);
     for (const other of others) {
-      await this.prisma.driver.update({ where: { id: other.id }, data: { isPrimary: false } });
+      if (!isDemoMode()) {
+        await this.prisma.driver.update({ where: { id: other.id }, data: { isPrimary: false } });
+      }
       this.drivers.set(other.id, { ...other, isPrimary: false });
     }
   }

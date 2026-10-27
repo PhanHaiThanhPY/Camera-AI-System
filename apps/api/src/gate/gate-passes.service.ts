@@ -11,8 +11,8 @@ import { WeighReadingRepository } from "./weigh-reading.repository";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { MasterDataService } from "./master-data.service";
 import { NO_MASTER_LINK } from "./master.types";
-import { randomNetKg, randomTareKg } from "./gate.mock";
-import type { AuditEntry, Classification, DetectionInput, GateOverrides, GatePass, WeighReading, WeighSummary } from "./gate.types";
+import { randomDemoPlate, randomDemoShots, randomNetKg, randomTareKg } from "./gate.mock";
+import type { AuditEntry, CaptureAttempt, CaptureShot, Classification, DetectionInput, GateOverrides, GatePass, PlateCapture, WeighReading, WeighSummary } from "./gate.types";
 import {
   computeVisitStatus,
   deriveReasons,
@@ -43,15 +43,37 @@ export type ClearScope = "resolved" | "all";
 
 export type GateEvent = { type: "upsert"; pass: GatePass } | { type: "remove"; id: string };
 
+/** Tham số cho mô phỏng (nút "Mô phỏng cân + chụp" ở dashboard và DemoSeedService) — đi qua đúng luồng thật
+ *  (resolvePassForWeighSignal + openCaptureWindow + submitCaptureResult), không phải code riêng. */
+export interface SimulateOptions {
+  plateNumber?: string;
+  scaleId?: string;
+  tareKg?: number;
+  grossKg?: number;
+  shotCount?: number;
+  forceCaptureFailure?: boolean;
+  shots?: CaptureShot[];
+}
+
+interface PendingCapture {
+  expected: number;
+  deadlineAt: string;
+  timer: NodeJS.Timeout;
+  /** Lượt vào (chưa có weighing trước đó) ghi vào `capture`; lượt ra (đã có weighing) ghi vào `exitCapture` —
+   *  giữ đúng ngữ nghĩa cũ của 2 field này (xem PlateCapture ở gate.types.ts). */
+  target: "capture" | "exitCapture";
+}
+
 const UNAVAILABLE: Classification = { code: null, confidence: null, source: "unavailable" };
 
 /**
- * Postgres là nguồn dữ liệu duy nhất (xem GatePassRepository). Service chỉ còn giữ hai Map transient,
- * thuần tuý để điều phối trong lúc một phiên nhận diện đang chạy — không phải dữ liệu nghiệp vụ, không
- * cần và không nên sống sót qua một lần khởi động lại:
- *   - passByTrack: track (cameraId:trackId) → id lượt xe tương ứng, để các sự kiện refine sau của cùng
- *     track cập nhật đúng lượt thay vì tạo trùng.
- *   - exitTracks: track nào trong số đó là lượt xe RA (so với VÀO), để không ghi đè nhầm chiều.
+ * Postgres là nguồn dữ liệu duy nhất (xem GatePassRepository). Service giữ vài Map transient, thuần tuý để
+ * điều phối trong lúc một phiên đang chạy — không phải dữ liệu nghiệp vụ, không cần và không nên sống sót
+ * qua một lần khởi động lại:
+ *   - passByTrack/exitTracks: luồng camera continuous-detection CŨ (ingestDetection) — vẫn giữ nguyên, không
+ *     xoá, nhưng python/detect/pipeline.py không còn gọi theo đường này nữa (xem openCaptureWindow bên dưới).
+ *   - pendingCaptures: luồng MỚI cân-trước-chụp-sau — passId → đợt chờ ảnh đang mở (xem openCaptureWindow/
+ *     submitCaptureResult/finalizeCapture).
  */
 @Injectable()
 export class GatePassesService {
@@ -59,6 +81,7 @@ export class GatePassesService {
   private readonly config = readVerificationConfig();
   private readonly passByTrack = new Map<string, string>();
   private readonly exitTracks = new Set<string>();
+  private readonly pendingCaptures = new Map<string, PendingCapture>();
   /** Luồng sự kiện cho realtime (SSE). */
   public readonly events = new Subject<GateEvent>();
 
@@ -90,6 +113,7 @@ export class GatePassesService {
     const matching = targets.filter((pass) => resolutions.includes(pass.resolution));
     for (const pass of matching) {
       this.forgetTrack(pass.id);
+      this.forgetCapture(pass.id);
       this.events.next({ type: "remove", id: pass.id });
     }
     await this.passes.deleteMany(matching.map((pass) => pass.id));
@@ -105,6 +129,7 @@ export class GatePassesService {
     await this.readings.deleteByIds(pass.weighing?.readingIds ?? []);
     await this.passes.delete(id);
     this.forgetTrack(id);
+    this.forgetCapture(id);
     this.events.next({ type: "remove", id });
     return { removed: 1 };
   }
@@ -115,6 +140,14 @@ export class GatePassesService {
         this.passByTrack.delete(trackKey);
         this.exitTracks.delete(trackKey);
       }
+    }
+  }
+
+  private forgetCapture(passId: string): void {
+    const window = this.pendingCaptures.get(passId);
+    if (window !== undefined) {
+      clearTimeout(window.timer);
+      this.pendingCaptures.delete(passId);
     }
   }
 
@@ -207,14 +240,16 @@ export class GatePassesService {
 
   /**
    * Cân giả lập lúc xe vào (xe trống): hard code, chưa có trạm cân thật, bật bằng WEIGHBRIDGE_MOCK_RANDOM=true (mặc định đang tắt).
-   * Đi qua đúng đường ingestReading như số liệu thật nên có thể thay bằng POST từ trạm cân mà không đổi logic ghép.
+   * Gắn theo luồng camera continuous-detection CŨ (ingestDetection, đã biết biển số) — ghép theo biển số qua
+   * matchReadingByPlate(), KHÔNG mở đợt chờ ảnh (openCaptureWindow) như luồng cân-trước-chụp-sau mới, để không
+   * đè ảnh continuous-detection đã có bằng một đợt chờ ảnh không bao giờ được trả lời.
    */
   private async mockEntryWeigh(pass: GatePass): Promise<void> {
     if (process.env.WEIGHBRIDGE_MOCK_RANDOM !== "true") {
       return;
     }
     const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
-    await this.ingestReading({ ...base, grossKg: null, tareKg: randomTareKg(), measuredAt: new Date().toISOString() }, "mock");
+    await this.matchReadingByPlate({ ...base, grossKg: null, tareKg: randomTareKg(), measuredAt: new Date().toISOString() }, "mock");
   }
 
   /** Cân giả lập lúc xe ra (đã chở đá lên): gross = tare lúc vào + hàng random, để net luôn hợp lý. */
@@ -224,18 +259,18 @@ export class GatePassesService {
     }
     const tareKg = pass.weighing?.tareKg ?? randomTareKg();
     const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
-    await this.ingestReading({ ...base, grossKg: tareKg + randomNetKg(), tareKg: null, measuredAt: new Date().toISOString() }, "mock");
+    await this.matchReadingByPlate({ ...base, grossKg: tareKg + randomNetKg(), tareKg: null, measuredAt: new Date().toISOString() }, "mock");
   }
 
   /**
-   * Điểm vào của hệ thống cân ngoài. Tự ghép với lượt xe đang chờ (đã vào, chưa ra) gần nhất theo biển số.
-   * Không có lượt nào đang chờ (xe mới tới lần đầu, hoặc lượt trước của xe này đã vào/ra xong rồi) thì tạo
-   * một lượt mới và coi số liệu này là cân đầu vào của lượt mới — đúng yêu cầu "đã vào đã ra rồi, cân tiếp thì tạo record mới".
+   * Luồng camera continuous-detection CŨ: ghép số liệu cân với lượt xe đang chờ (đã vào, chưa ra) gần nhất
+   * THEO BIỂN SỐ — biển số đã biết từ trước (camera chạy liên tục, độc lập với cân). Không có lượt nào đang
+   * chờ thì tạo lượt mới, coi số liệu này là cân đầu vào. Chỉ dùng cho mockEntryWeigh/mockExitWeigh (giữ
+   * nguyên hành vi cũ) — luồng MỚI (ingestReading/simulateWeighAndCapture) dùng resolvePassForWeighSignal
+   * (theo trạm cân, không theo biển số — xem đó để biết lý do: cân xong mới chụp nên lúc cân CHƯA có biển số).
    */
-  public async ingestReading(input: ReadingInput, source: WeighReading["source"] = "external"): Promise<WeighReading> {
+  private async matchReadingByPlate(input: ReadingInput, source: WeighReading["source"]): Promise<WeighReading> {
     const reading = await this.readings.create({ ...input, source });
-
-    // Lần cân thứ hai của lượt xe đã có một lần cân (đã vào, chưa ra): ghép theo biển số.
     const pending = await this.passes.findPending();
     let best: { pass: GatePass; score: number } | null = null;
     for (const pass of pending) {
@@ -244,16 +279,230 @@ export class GatePassesService {
         best = { pass, score };
       }
     }
-
     if (best !== null) {
       await this.attachReading(best.pass, reading, "system", null);
     } else if (reading.plateNumber !== null && normalizePlate(reading.plateNumber).length >= 4) {
-      // Không có lượt nào đang mở cho biển này (chưa từng vào, hoặc lượt trước đã vào/ra xong) → lượt mới.
       await this.createFromReading(reading);
     } else {
       this.logger.warn(`weigh-reading unmatched id=${reading.id} ticket=${reading.ticketNo ?? "-"}`);
     }
     return reading;
+  }
+
+  /**
+   * Luồng MỚI cân-trước-chụp-sau: ghép số liệu cân THEO TRẠM CÂN (scaleId), không theo biển số — lúc cân
+   * xong còn chưa biết biển số (biển số chỉ có SAU khi camera chụp, xem openCaptureWindow/submitCaptureResult).
+   * Một trạm cân chỉ có đúng 1 xe trên bàn cân một lúc, nên "lượt đang mở của đúng trạm này, cân lần gần nhất
+   * trong vòng GATE_MATCH_WINDOW_SECONDS" coi là cùng một xe (lần cân thứ hai — lượt RA); quá cửa sổ đó (xe đã
+   * rời bàn cân đi nơi khác rồi mới quay lại) thì luôn tạo lượt mới (lượt VÀO), dù có thể trùng xe thật ngoài
+   * đời — hạn chế đã biết khi không còn biển số để phân biệt, xem ARCHITECTURE.md.
+   */
+  private async resolvePassForWeighSignal(input: ReadingInput, source: WeighReading["source"]): Promise<{ reading: WeighReading; pass: GatePass; isSecondLeg: boolean }> {
+    const reading = await this.readings.create({ ...input, source });
+    const openForScale = await this.findOpenPassForScale(input.scaleId, Date.parse(reading.measuredAt));
+    if (openForScale !== undefined) {
+      await this.attachReading(openForScale, reading, "system", null);
+      return { reading, pass: openForScale, isSecondLeg: true };
+    }
+    const capture = this.captureFromReading(reading);
+    const pass = await this.registerPass(capture, UNAVAILABLE, UNAVAILABLE, { autoMatchReadings: false });
+    await this.attachReading(pass, reading, "system", null);
+    return { reading, pass, isSecondLeg: false };
+  }
+
+  /** Lượt đang "mở" (đã vào, chưa ra) của đúng trạm cân này, cân lần gần nhất trong vòng
+   *  GATE_MATCH_WINDOW_SECONDS — xem resolvePassForWeighSignal. */
+  private async findOpenPassForScale(scaleId: string, atMs: number): Promise<GatePass | undefined> {
+    const pending = await this.passes.findPending();
+    let best: GatePass | undefined;
+    for (const pass of pending) {
+      if (pass.visitStatus === "EXITED" || pass.weighing === null || pass.weighing.scaleId !== scaleId) {
+        continue;
+      }
+      // Lần cân GẦN NHẤT của lượt này — không theo thứ tự field (tare/gross cái nào tới sau mới là "gần nhất").
+      const lastAt = [pass.weighing.tareAt, pass.weighing.grossAt].filter((value): value is string => value !== null).sort().pop() ?? pass.weighing.firstMeasuredAt;
+      const gapSeconds = Math.abs(atMs - Date.parse(lastAt)) / 1000;
+      if (!Number.isFinite(gapSeconds) || gapSeconds > this.config.matchWindowSeconds) {
+        continue;
+      }
+      if (best === undefined || pass.weighing.firstMeasuredAt > best.weighing!.firstMeasuredAt) {
+        best = pass;
+      }
+    }
+    return best;
+  }
+
+  /** Điểm vào của hệ thống cân ngoài (và nền của nút "Mô phỏng cân + chụp"): ghép theo trạm cân rồi mở ngay
+   *  một đợt chờ ảnh camera — đúng luồng mới "cân xong mới chụp" (xem resolvePassForWeighSignal). */
+  public async ingestReading(input: ReadingInput, source: WeighReading["source"] = "external"): Promise<WeighReading> {
+    const { reading, pass, isSecondLeg } = await this.resolvePassForWeighSignal(input, source);
+    await this.openCaptureWindow(pass.id, isSecondLeg ? "exitCapture" : "capture");
+    return reading;
+  }
+
+  /**
+   * Demo/thử nghiệm: mô phỏng đúng luồng cân-trước-chụp-sau — không phải code riêng, đi qua đúng
+   * resolvePassForWeighSignal/openCaptureWindow/submitCaptureResult như cân/camera thật. Dùng cho nút
+   * "Mô phỏng cân + chụp" (không truyền gì — tự biết cân vào hay cân ra, xem dưới) và DemoSeedService
+   * (truyền tham số cụ thể để dựng đủ các trạng thái mẫu).
+   *
+   * Không truyền grossKg/tareKg: tự quyết theo trạng thái trạm cân, giống bấm nút thật mỗi lần 1 xe đi qua —
+   * đang có xe "mở" trên trạm (vừa cân vào, chưa ra) thì đây là lần cân RA (gross) để khép lượt đó lại; nếu
+   * không thì đây là lần cân VÀO (tare) của một xe mới. Không tự làm vậy thì bấm nút 2 lần liên tiếp sẽ bị
+   * coi là 2 lần cân vào của cùng một "lượt đang mở" và bị từ chối (đã có lần cân này).
+   */
+  public async simulateWeighAndCapture(options: SimulateOptions = {}): Promise<GatePass> {
+    const scaleId = options.scaleId ?? "SCALE-01";
+    let grossKg: number | null = null;
+    let tareKg: number | null = null;
+    let openPass: GatePass | undefined;
+    if (options.grossKg !== undefined || options.tareKg !== undefined) {
+      grossKg = options.grossKg ?? null;
+      tareKg = options.tareKg ?? null;
+    } else {
+      openPass = await this.findOpenPassForScale(scaleId, Date.now());
+      if (openPass !== undefined) {
+        grossKg = (openPass.weighing?.tareKg ?? randomTareKg()) + randomNetKg();
+      } else {
+        tareKg = randomTareKg();
+      }
+    }
+    const { pass, isSecondLeg } = await this.resolvePassForWeighSignal(
+      {
+        scaleId,
+        ticketNo: `SIM${Date.now().toString(36).toUpperCase()}`,
+        plateNumber: null,
+        grossKg,
+        tareKg,
+        measuredAt: new Date().toISOString()
+      },
+      "mock"
+    );
+    await this.openCaptureWindow(pass.id, isSecondLeg ? "exitCapture" : "capture");
+
+    // Lượt RA (isSecondLeg) mà xe đã có biển từ lượt vào thì chụp lại đúng biển đó, cho giống thật.
+    const plateNumber = options.plateNumber ?? (isSecondLeg && pass.capture.plateText !== "" ? pass.capture.plateText : randomDemoPlate());
+    const expected = Math.max(1, Number(process.env.CAPTURE_EXPECTED_SHOTS ?? 4));
+    const shots = options.shots ?? randomDemoShots(plateNumber, options.shotCount ?? expected, options.forceCaptureFailure);
+    let result = pass;
+    for (const shot of shots) {
+      result = await this.submitCaptureResult(result.id, shot);
+    }
+    return result;
+  }
+
+  /** Mở một đợt chờ ảnh mới cho `passId` (tối đa CAPTURE_EXPECTED_SHOTS camera, hết CAPTURE_TIMEOUT_SECONDS
+   *  giây mà chưa đủ ảnh dùng được thì finalizeCapture tự chốt CAPTURE_FAILED). Đè lên đợt cũ nếu còn mở. */
+  private async openCaptureWindow(passId: string, target: "capture" | "exitCapture"): Promise<void> {
+    this.forgetCapture(passId);
+    const pass = await this.getPass(passId);
+    pass.captureState = "pending";
+    pass.captureAttempts = [];
+    await this.refresh(pass);
+    const expected = Math.max(1, Number(process.env.CAPTURE_EXPECTED_SHOTS ?? 4));
+    const timeoutMs = Math.max(1, Number(process.env.CAPTURE_TIMEOUT_SECONDS ?? 20)) * 1000;
+    const deadlineAt = new Date(Date.now() + timeoutMs).toISOString();
+    const timer = setTimeout(() => void this.finalizeCapture(passId), timeoutMs);
+    this.pendingCaptures.set(passId, { expected, deadlineAt, timer, target });
+  }
+
+  /** Đợt chờ ảnh đang mở của một trạm cân (nếu có) — mỗi tiến trình camera (python/detect/pipeline.py) polling
+   *  GET /gate/capture-requests/pending để biết có cần chụp ngay không. */
+  public async findPendingCaptureByScale(scaleId: string): Promise<{ passId: string; deadlineAt: string } | null> {
+    for (const [passId, window] of this.pendingCaptures) {
+      const pass = await this.passes.findById(passId);
+      if (pass !== null && pass.weighing?.scaleId === scaleId) {
+        return { passId, deadlineAt: window.deadlineAt };
+      }
+    }
+    return null;
+  }
+
+  /** Một camera gửi kết quả cho đợt chờ ảnh đang mở của `passId`. Đủ số camera mong đợi thì chốt ngay. */
+  public async submitCaptureResult(passId: string, shot: CaptureShot): Promise<GatePass> {
+    const pass = await this.getPass(passId);
+    if (pass.captureState !== "pending") {
+      throw new ConflictException("Lượt xe này không có đợt chờ ảnh đang mở.");
+    }
+    const attempt: CaptureAttempt = {
+      cameraId: shot.cameraId,
+      plateNumber: shot.plateNumber,
+      ocrConfidence: shot.ocrConfidence,
+      detectorConfidence: shot.detectorConfidence,
+      vehicleType: shot.vehicleType ?? null,
+      material: shot.material ?? null,
+      imageUrl: shot.imageUrl ?? null,
+      quality: shot.quality
+    };
+    pass.captureAttempts = [...pass.captureAttempts, attempt];
+    await this.passes.save(pass);
+    const window = this.pendingCaptures.get(passId);
+    if (window !== undefined && pass.captureAttempts.length >= window.expected) {
+      const finalized = await this.finalizeCapture(passId);
+      if (finalized === null) {
+        throw new NotFoundException("Không tìm thấy lượt xe.");
+      }
+      return finalized;
+    }
+    return pass;
+  }
+
+  /**
+   * Hết giờ chờ hoặc đã đủ ảnh: chọn shot "ok" có OCR cao nhất làm biển số chính thức; loại xe/loại đá lấy
+   * riêng từ shot có confidence cao nhất (có thể là camera khác). Không shot nào "ok" → captureState="failed"
+   * (CAPTURE_FAILED, "cần kiểm tra lại") nhưng vẫn giữ captureAttempts để người vận hành xem ảnh + nhập tay
+   * qua ResolvePanel có sẵn — không xoá dữ liệu cân đã có. Lượt RA (target="exitCapture") chỉ ghi exitCapture,
+   * giữ nguyên vehicleType/material đã có từ lượt VÀO, đúng ngữ nghĩa cũ của ingestDetection's "exit_sighting".
+   */
+  private async finalizeCapture(passId: string): Promise<GatePass | null> {
+    const window = this.pendingCaptures.get(passId);
+    const target = window?.target ?? "capture";
+    this.forgetCapture(passId);
+    const pass = await this.passes.findById(passId);
+    if (pass === null || pass.captureState !== "pending") {
+      return pass;
+    }
+
+    const usable = pass.captureAttempts.filter((attempt) => attempt.quality === "ok" && attempt.plateNumber !== null);
+    if (usable.length === 0) {
+      pass.captureState = "failed";
+      this.pushAudit(pass, "system", "capture_failed", null, null, { target, attempts: pass.captureAttempts.length });
+      return this.refresh(pass);
+    }
+
+    const best = usable.reduce((a, b) => ((b.ocrConfidence ?? 0) > (a.ocrConfidence ?? 0) ? b : a));
+    const plateText = best.plateNumber ?? "";
+    const newCapture: PlateCapture = {
+      source: "video",
+      cameraId: best.cameraId,
+      clockSource: "server",
+      capturedAt: pass.capture.capturedAt,
+      trackId: `capture-${pass.id}`,
+      plateText,
+      plateNormalized: normalizePlate(plateText),
+      ocrConfidence: best.ocrConfidence,
+      detectorConfidence: best.detectorConfidence,
+      imageUrl: best.imageUrl
+    };
+
+    pass.captureState = null;
+    if (target === "exitCapture") {
+      pass.exitCapture = newCapture;
+    } else {
+      pass.capture = newCapture;
+      const bestVehicle = pass.captureAttempts.reduce<CaptureAttempt | null>(
+        (acc, attempt) => (attempt.vehicleType !== null && (acc === null || (attempt.vehicleType.confidence ?? 0) > (acc.vehicleType?.confidence ?? 0)) ? attempt : acc),
+        null
+      );
+      const bestMaterial = pass.captureAttempts.reduce<CaptureAttempt | null>(
+        (acc, attempt) => (attempt.material !== null && (acc === null || (attempt.material.confidence ?? 0) > (acc.material?.confidence ?? 0)) ? attempt : acc),
+        null
+      );
+      pass.vehicleType = bestVehicle?.vehicleType ?? UNAVAILABLE;
+      pass.material = bestMaterial?.material ?? UNAVAILABLE;
+    }
+    this.pushAudit(pass, "system", "capture_complete", null, null, { target, plate: plateText, cameras: pass.captureAttempts.length });
+    return this.refresh(pass);
   }
 
   public async linkReading(passId: string, readingId: string, actor: string, reason: string | null): Promise<GatePass> {
@@ -286,8 +535,8 @@ export class GatePassesService {
     if ((decision === "REJECTED" || hasOverride || acceptsUnverified) && input.reason === null) {
       throw new BadRequestException("Từ chối, chỉnh sửa kết quả AI hoặc xác nhận lượt chưa đạt kiểm tra bắt buộc ghi lý do.");
     }
-    if (decision === "CONFIRMED" && (pass.status === "WAITING_WEIGHT" || pass.status === "WAITING_SECOND_WEIGH")) {
-      throw new ConflictException("Chưa đủ hai lần cân (gross và tare), không thể xác nhận.");
+    if (decision === "CONFIRMED" && (pass.status === "WAITING_WEIGHT" || pass.status === "WAITING_SECOND_WEIGH" || pass.status === "WAITING_CAPTURE")) {
+      throw new ConflictException("Lượt xe chưa đủ dữ liệu (cân hoặc ảnh chụp), không thể xác nhận.");
     }
     this.validateOverrides(input.overrides);
 
@@ -325,7 +574,8 @@ export class GatePassesService {
       plateText: detection.plateNumber,
       plateNormalized: normalizePlate(detection.plateNumber),
       ocrConfidence: detection.ocrConfidence ?? null,
-      detectorConfidence: detection.detectorConfidence ?? null
+      detectorConfidence: detection.detectorConfidence ?? null,
+      imageUrl: detection.imageUrl ?? null
     };
   }
 
@@ -341,7 +591,8 @@ export class GatePassesService {
       plateText,
       plateNormalized: normalizePlate(plateText),
       ocrConfidence: null,
-      detectorConfidence: null
+      detectorConfidence: null,
+      imageUrl: null
     };
   }
 
@@ -365,6 +616,8 @@ export class GatePassesService {
       id: randomUUID(),
       createdAt: "",
       updatedAt: "",
+      captureState: null,
+      captureAttempts: [],
       capture,
       exitCapture: null,
       vehicleType,
@@ -445,6 +698,15 @@ export class GatePassesService {
   }
 
   private recomputeFields(pass: GatePass): void {
+    if (pass.captureState === "pending") {
+      // Đang chờ ảnh từ camera (luồng cân-trước-chụp-sau) — chưa có gì để chạy kiểm tra chéo, chỉ set
+      // status/visitStatus trực tiếp. Checks/master giữ nguyên giá trị cũ, sẽ tính lại đầy đủ khi
+      // finalizeCapture() xong (captureState trở về null hoặc "failed").
+      pass.status = "WAITING_CAPTURE";
+      pass.statusReasons = deriveReasons(pass.status, pass.checks);
+      pass.visitStatus = computeVisitStatus(pass);
+      return;
+    }
     pass.effective = {
       plateNumber: pass.overrides.plateNumber ?? pass.capture.plateText,
       vehicleType: pass.overrides.vehicleType ?? pass.vehicleType.code,
@@ -452,7 +714,7 @@ export class GatePassesService {
     };
     pass.master = this.master.lookup(pass.effective.plateNumber);
     pass.checks = runChecks(pass, this.config);
-    pass.status = deriveStatus(pass.checks, pass.weighing, pass.master);
+    pass.status = deriveStatus(pass.checks, pass.weighing, pass.master, pass.captureState);
     pass.statusReasons = deriveReasons(pass.status, pass.checks);
     pass.visitStatus = computeVisitStatus(pass);
   }

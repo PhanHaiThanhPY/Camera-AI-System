@@ -1,0 +1,4 @@
+aiortc
+aiohttp
+opencv-python-headless
+pillow

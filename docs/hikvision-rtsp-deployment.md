@@ -109,7 +109,12 @@ Camera phải được căn sao cho biển số chiếm đủ số pixel trong f
 
 ## 6. Phần cần bổ sung vào source hiện tại
 
-Source hiện tại chưa đọc RTSP liên tục. Cần thêm một `Camera Capture Service` trước AI worker:
+`python/detect/pipeline.py` nay đã giữ một kết nối RTSP sống suốt tiến trình (`grab()` liên tục,
+không decode, rẻ) và chỉ chạy nhận diện khi có tín hiệu cân (xem `docs/gate-control-scope.md`,
+mục "Pipeline nhận diện") — nhưng vẫn **chưa tự reconnect** khi mất kết nối (`grab()` thất bại thì
+tiến trình thoát luôn) và chưa có service riêng theo dõi trạng thái `ONLINE/OFFLINE/RECONNECTING`
+hay API bật/tắt từng camera. Cần thêm một `Camera Capture Service` đứng trước, đảm nhiệm đúng phần
+này (reconnect, health, start/stop), không phải viết lại phần nhận diện:
 
 ```text
 Hikvision RTSP
@@ -165,8 +170,8 @@ Tối thiểu nên có:
 
 Khi chạy production nên bổ sung:
 
-- Docker Compose hoặc systemd để tự khởi động lại service (NestJS, Postgres, tiến trình python/detect theo từng camera).
-- PostgreSQL đã thay JSON cho state cổng/master data/Telegram. Hệ thống không lưu ảnh/video bằng chứng — chỉ số liệu nhận diện, nên không cần object storage hay chính sách xoá media cũ.
+- Docker Compose hoặc systemd để tự khởi động lại service (NestJS, Postgres, MinIO, tiến trình python/detect theo từng camera).
+- PostgreSQL đã thay JSON cho state cổng/master data/Telegram. Ảnh bằng chứng (crop vùng xe lúc nhận diện) lưu trên MinIO — đặt `MINIO_PUBLIC_URL` đúng domain công khai khi deploy, và lên kế hoạch dọn ảnh cũ định kỳ (bucket không tự xoá) vì object storage sẽ phình dần theo lưu lượng xe.
 - Redis/BullMQ cho hàng đợi frame nếu số camera tăng và cần điều phối tải giữa các tiến trình python.
 - HTTPS, đăng nhập và phân quyền.
 - Backup tự động cho Postgres.

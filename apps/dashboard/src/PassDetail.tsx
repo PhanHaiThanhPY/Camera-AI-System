@@ -1,7 +1,48 @@
 import { FormEvent, ReactElement, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-export type VerificationStatus = "NOT_IN_YARD" | "WAITING_WEIGHT" | "WAITING_SECOND_WEIGH" | "VERIFIED" | "REVIEW_REQUIRED" | "MISMATCH";
+/** State dùng chung cho lightbox phóng to ảnh — mỗi nơi có ảnh (CaptureGallery, PhienCanPanel, CapturesTable)
+ *  tự giữ state riêng qua hook này, chỉ dùng chung component <Lightbox>. */
+export function useLightbox(): { openUrl: string | null; open: (url: string) => void; close: () => void } {
+  const [openUrl, setOpenUrl] = useState<string | null>(null);
+  return { openUrl, open: setOpenUrl, close: () => setOpenUrl(null) };
+}
+
+/** Bấm vào bất kỳ ảnh nào cũng mở ảnh đó phóng to toàn màn hình — bấm ra ngoài, bấm nút đóng, hoặc Esc để thoát. */
+export function Lightbox({ url, onClose }: { url: string | null; onClose: () => void }): ReactElement | null {
+  useEffect(() => {
+    if (url === null) {
+      return undefined;
+    }
+    const handleKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [url, onClose]);
+
+  if (url === null) {
+    return null;
+  }
+  return (
+    <div className="lightbox-overlay" onClick={onClose} role="presentation">
+      <button aria-label="Đóng ảnh" className="lightbox-close" onClick={onClose} type="button">×</button>
+      <img alt="Ảnh phóng to" className="lightbox-image" onClick={(event) => event.stopPropagation()} src={url} />
+    </div>
+  );
+}
+
+export type VerificationStatus =
+  | "NOT_IN_YARD"
+  | "WAITING_CAPTURE"
+  | "WAITING_WEIGHT"
+  | "WAITING_SECOND_WEIGH"
+  | "VERIFIED"
+  | "REVIEW_REQUIRED"
+  | "MISMATCH"
+  | "CAPTURE_FAILED";
 export type Resolution = "PENDING" | "CONFIRMED" | "REJECTED";
 /** ENTERED = đã cân đầu vào, đang trong bãi. EXITED = đã cân đầu ra, lượt khép kín (net = cân ra − cân vào). */
 export type VisitStatus = "ENTERED" | "EXITED";
@@ -27,11 +68,24 @@ export interface PlateCapture {
   plateText: string;
   ocrConfidence: number | null;
   detectorConfidence: number | null;
+  /** Link ảnh (MinIO) chụp lúc nhận diện. null = chưa cấu hình MinIO hoặc lượt từ cân (weighbridge). */
+  imageUrl: string | null;
+}
+
+export interface CaptureAttempt {
+  cameraId: string;
+  plateNumber: string | null;
+  ocrConfidence: number | null;
+  imageUrl: string | null;
+  quality: "ok" | "blurry" | "no_plate";
 }
 
 export interface GatePass {
   master: MasterLink;
   id: string;
+  /** null = luồng bình thường/đã xong. "pending" = đang chờ ảnh camera. "failed" = CAPTURE_FAILED. */
+  captureState: "pending" | "failed" | null;
+  captureAttempts: CaptureAttempt[];
   capture: PlateCapture;
   /** Ảnh chụp lúc xe ra — null khi xe chưa ra hoặc lượt này không có camera xác nhận lúc ra. */
   exitCapture: PlateCapture | null;
@@ -66,12 +120,15 @@ export const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:40
 export const API_ORIGIN = API_BASE_URL.replace(/\/api\/?$/, "");
 export const STATUS_LABELS: Record<VerificationStatus, string> = {
   NOT_IN_YARD: "Không tìm thấy xe ở bãi",
+  WAITING_CAPTURE: "Đang chờ ảnh chụp",
   WAITING_WEIGHT: "Chờ cân lần 1",
   WAITING_SECOND_WEIGH: "Chờ cân lần 2",
   VERIFIED: "Khớp",
   REVIEW_REQUIRED: "Cần xem lại",
-  MISMATCH: "Không khớp"
+  MISMATCH: "Không khớp",
+  CAPTURE_FAILED: "Cần kiểm tra lại (ảnh chụp lỗi)"
 };
+const SHOT_QUALITY_LABELS: Record<CaptureAttempt["quality"], string> = { ok: "Đọc được", blurry: "Ảnh mờ", no_plate: "Không thấy biển" };
 const RESOLUTION_LABELS: Record<Resolution, string> = { PENDING: "Chưa xử lý", CONFIRMED: "Đã xác nhận", REJECTED: "Đã từ chối" };
 export const VISIT_LABELS: Record<VisitStatus, string> = { ENTERED: "Đã vào bãi", EXITED: "Đã ra khỏi bãi" };
 const CHECK_LABELS: Record<CheckResult, string> = { pass: "ĐẠT", warn: "LƯU Ý", fail: "LỖI", skipped: "BỎ QUA" };
@@ -162,10 +219,77 @@ function luongHang(pass: GatePass): string {
   return legs.exit.kg >= legs.entry.kg ? "Xuất hàng" : "Nhập hàng";
 }
 
-/** Thẻ "Phiên cân": số liệu tổng/bì/hàng, thông tin phiếu và thao tác xác nhận — khớp bố cục trong proposal. */
-export function PhienCanPanel({ pass, catalog, offline }: { pass: GatePass; catalog: Catalog | undefined; offline?: boolean }): ReactElement {
+const CAMERA_STEPS = ["Nhận tín hiệu cân", "Yêu cầu camera chụp", "Nhận đủ ảnh", "Đối chiếu xong"];
+
+/** Bước hiện tại của đợt chụp (1-4) — suy từ dữ liệu thật (captureAttempts/captureState/status), không phải mô phỏng giả. */
+function captureStepCount(pass: GatePass): number {
+  if (pass.captureAttempts.length === 0) {
+    return 1;
+  }
+  if (pass.captureState === "pending") {
+    return 2;
+  }
+  if (pass.status === "WAITING_WEIGHT" || pass.status === "WAITING_SECOND_WEIGH") {
+    return 3;
+  }
+  return 4;
+}
+
+/**
+ * "Bốn góc nhìn • một chuyến xe": lưới 2x2 ảnh từng camera trả về cho đợt chụp gần nhất (captureAttempts) —
+ * dữ liệu thật (biển số/độ đọc được của từng camera), không phải ảnh minh hoạ tĩnh như bản mô phỏng cũ.
+ * Luôn đủ CAPTURE_EXPECTED_SHOTS ô (mặc định 4); camera chưa trả ảnh hoặc ảnh lỗi thì hiện ô trống/ghi rõ lý do.
+ */
+export function CaptureGallery({ pass }: { pass: GatePass }): ReactElement {
+  const step = captureStepCount(pass);
+  const lightbox = useLightbox();
+  return (
+    <div className="panel gate-block sim-camera-panel">
+      <p className="section-kicker">BỐN GÓC NHÌN · MỘT CHUYẾN XE</p>
+      <div className="camera-grid">
+        {pass.captureAttempts.map((attempt, index) => (
+          <div className="camera-tile" key={`${attempt.cameraId}-${index}`}>
+            <span className="sim-camera-badge">CẢNH MÔ PHỎNG</span>
+            {attempt.imageUrl !== null ? (
+              <button aria-label={`Xem to ${attempt.cameraId}`} className="camera-tile-button" onClick={() => lightbox.open(attempt.imageUrl!)} type="button">
+                <img alt={attempt.cameraId} src={attempt.imageUrl} />
+              </button>
+            ) : (
+              <div className="camera-tile-empty"><span>Không có ảnh</span></div>
+            )}
+            <p className="camera-caption">C{index + 1} · {attempt.cameraId} · {SHOT_QUALITY_LABELS[attempt.quality]}</p>
+          </div>
+        ))}
+      </div>
+      <div className="sim-step-track">
+        {CAMERA_STEPS.map((label, index) => (
+          <span className={index < step ? "sim-step-done" : ""} key={label}>{String(index + 1).padStart(2, "0")} · {label}</span>
+        ))}
+      </div>
+      <p className="muted-text sim-camera-caption">
+        {pass.status === "CAPTURE_FAILED"
+          ? "Không camera nào đọc được biển số rõ ràng — sửa tay biển số/loại xe/loại đá ở khung bên cạnh."
+          : "Camera cùng chụp khi trạm cân báo xong; hệ thống chọn ảnh đọc biển rõ nhất làm bằng chứng chính thức."}
+      </p>
+      <Lightbox url={lightbox.openUrl} onClose={lightbox.close} />
+    </div>
+  );
+}
+
+/** Khi editable=false (Trạm cân trực tiếp — chỉ xem): thông báo rõ phải vào Sổ cân & truy vết mới sửa/xác nhận được. */
+function ViewOnlyNote({ pass }: { pass: GatePass }): ReactElement {
+  if (pass.resolution !== "PENDING") {
+    return <p className="muted-text">Lượt xe đã {RESOLUTION_LABELS[pass.resolution].toLowerCase()}.</p>;
+  }
+  return <p className="muted-text">Chỉ xem tại đây — vào <strong>Sổ cân &amp; truy vết</strong> để xác nhận, từ chối hoặc sửa biển số/loại xe/loại đá.</p>;
+}
+
+/** Thẻ "Phiên cân": số liệu tổng/bì/hàng, thông tin phiếu và thao tác xác nhận — khớp bố cục trong proposal.
+ *  editable=false (Trạm cân trực tiếp): ẩn hẳn nút/ô sửa, chỉ còn xem — sửa chuyển sang Sổ cân & truy vết. */
+export function PhienCanPanel({ pass, catalog, offline, editable = true }: { pass: GatePass; catalog: Catalog | undefined; offline?: boolean; editable?: boolean }): ReactElement {
   const w = pass.weighing;
   const ticketCode = w?.ticketNo ?? pass.id.slice(0, 8).toUpperCase();
+  const lightbox = useLightbox();
   return (
     <div className="panel gate-block">
       <div className="panel-heading">
@@ -185,13 +309,30 @@ export function PhienCanPanel({ pass, catalog, offline }: { pass: GatePass; cata
         <div><dt>Nhận dạng</dt><dd>{labelOf(catalog?.materials, pass.material.code)}</dd></div>
         <div><dt>Quyết định</dt><dd>{QUYET_DINH_LABELS[pass.resolution]}</dd></div>
       </dl>
+      {(pass.capture.imageUrl !== null || pass.exitCapture?.imageUrl != null) && (
+        <div className="capture-image-row">
+          {pass.capture.imageUrl !== null && (
+            <button className="capture-image-link" onClick={() => lightbox.open(pass.capture.imageUrl as string)} type="button">
+              <img alt="Ảnh chụp lúc vào" loading="lazy" src={pass.capture.imageUrl} />
+              <span>Ảnh lúc vào</span>
+            </button>
+          )}
+          {pass.exitCapture?.imageUrl != null && (
+            <button className="capture-image-link" onClick={() => lightbox.open(pass.exitCapture!.imageUrl as string)} type="button">
+              <img alt="Ảnh chụp lúc ra" loading="lazy" src={pass.exitCapture.imageUrl} />
+              <span>Ảnh lúc ra</span>
+            </button>
+          )}
+        </div>
+      )}
+      <Lightbox url={lightbox.openUrl} onClose={lightbox.close} />
       {pass.statusReasons.length > 0 && (
         <ul className="status-reasons" aria-label="Lý do trạng thái">
           {pass.statusReasons.map((reason) => <li key={reason}>{reason}</li>)}
         </ul>
       )}
       {offline === true && <p className="offline-note">Tiếp tục lưu tại trạm. Phiếu được đồng bộ khi kết nối trở lại.</p>}
-      <ResolvePanel key={pass.id} catalog={catalog} pass={pass} />
+      {editable ? <ResolvePanel key={pass.id} catalog={catalog} pass={pass} /> : <ViewOnlyNote pass={pass} />}
       {w !== null && (
         <div className="ticket-summary">
           <strong>PHIẾU {ticketCode} · {formatKg(w.netKg)}</strong>
@@ -222,6 +363,9 @@ export function ResolvePanel({ pass, catalog }: { pass: GatePass; catalog: Catal
     onSuccess: () => {
       setError(null);
       void queryClient.invalidateQueries({ queryKey: ["gate-passes"] });
+      // Sổ cân & truy vết (CapturesTable.tsx) dùng key riêng "gate-passes-table" — sửa/xác nhận từ modal ở đó
+      // (xem EditModal) cần làm mới ngay, không đợi refetchInterval 3s.
+      void queryClient.invalidateQueries({ queryKey: ["gate-passes-table"] });
     },
     onError: (failure: unknown) => setError(failure instanceof Error ? failure.message : "Có lỗi xảy ra.")
   });
@@ -265,7 +409,7 @@ export function ResolvePanel({ pass, catalog }: { pass: GatePass; catalog: Catal
 }
 
 
-export function PassDetail({ pass, catalog, offline }: { pass: GatePass; catalog: Catalog | undefined; offline?: boolean }): ReactElement {
+export function PassDetail({ pass, catalog, offline, editable = true }: { pass: GatePass; catalog: Catalog | undefined; offline?: boolean; editable?: boolean }): ReactElement {
   const selected = pass;
   return (
     <div className="live-details">
@@ -289,7 +433,7 @@ export function PassDetail({ pass, catalog, offline }: { pass: GatePass; catalog
             </div>
 
             <div className="live-panels">
-              <PhienCanPanel catalog={catalog} offline={offline} pass={selected} />
+              <PhienCanPanel catalog={catalog} editable={editable} offline={offline} pass={selected} />
             </div>
 
             <div className="panel gate-block">

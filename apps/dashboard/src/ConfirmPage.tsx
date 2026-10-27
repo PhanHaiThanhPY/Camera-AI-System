@@ -1,6 +1,4 @@
 import { ReactElement } from "react";
-import { PhienCanPanel } from "./PassDetail";
-import type { Catalog, GatePass } from "./PassDetail";
 
 const MATERIALS = [
   { code: "sand", label: "Cát", caption: "Hạt mịn · màu và bề mặt" },
@@ -48,36 +46,18 @@ function MaterialReferencePanel(): ReactElement {
           <li>Ảnh chỉ mô tả lớp vật liệu nhìn thấy. Chất lượng cấp phối, độ ẩm và phần khuất cần quy trình lấy mẫu xác nhận.</li>
           <li>Hàng trộn, phủ bạt, bùn che hoặc thiếu sáng cần chuyển người kiểm tra; không tự gán sang loại gần nhất.</li>
         </ul>
-        <p className="material-training-note"><strong>Dữ liệu huấn luyện</strong><br />Cần lưu ảnh vùng hàng cùng nhãn đã xác nhận. Pipeline hiện chưa gửi ảnh về API.</p>
+        <p className="material-training-note"><strong>Dữ liệu huấn luyện</strong><br />Ảnh hiện lưu là crop quanh toàn bộ xe, chưa riêng vùng hàng. Muốn dùng cho huấn luyện cần ghép thêm nhãn đã xác nhận với đúng crop vùng hàng.</p>
       </aside>
     </div>
   );
 }
 
-/** Ưu tiên lượt cần xem lại/không khớp lên đầu hàng chờ; còn lại xếp theo thời gian chụp mới nhất. */
-function byPriority(first: GatePass, second: GatePass): number {
-  const weight = (pass: GatePass): number => (pass.status === "REVIEW_REQUIRED" || pass.status === "MISMATCH" ? 0 : 1);
-  const diff = weight(first) - weight(second);
-  return diff !== 0 ? diff : second.capture.capturedAt.localeCompare(first.capture.capturedAt);
-}
-
-/** Xác nhận vật liệu: nhãn chuẩn, nguyên tắc đối chiếu và các phiếu cần con người xác nhận. */
-export default function ConfirmPage({ rows, catalog, offline }: { rows: GatePass[]; catalog: Catalog | undefined; offline: boolean }): ReactElement {
-  const pending = rows.filter((row) => row.resolution === "PENDING").sort(byPriority);
-  const flagged = pending.filter((row) => row.status === "REVIEW_REQUIRED" || row.status === "MISMATCH").length;
-
+/** Xác nhận vật liệu: nhãn chuẩn và nguyên tắc đối chiếu — chỉ còn là trang tham khảo. Việc xem/sửa/xác
+ *  nhận từng lượt xe đã chuyển hẳn sang Sổ cân & truy vết (CapturesTable.tsx → PassPage.tsx). */
+export default function ConfirmPage(): ReactElement {
   return (
     <section className="main-column material-page">
       <MaterialReferencePanel />
-      <div className="material-queue-heading"><h2>Ảnh chờ xác nhận vật liệu</h2><span className="count-badge">{pending.length} phiếu · {flagged} cần đối chiếu</span></div>
-      <p className="material-queue-intro">Kết quả AI là đề xuất. Người vận hành xác nhận loại hàng để lưu nhãn đã kiểm duyệt vào hồ sơ lượt xe.</p>
-      {pending.length === 0 ? (
-        <div className="panel hero-panel"><div className="empty-state"><span className="empty-icon">✓</span><h3>Không có phiếu chờ xác nhận</h3><p>Phiếu mới sẽ xuất hiện tại đây sau khi AI nhận diện xe và vật liệu.</p></div></div>
-      ) : (
-        <div className="confirm-queue">
-          {pending.map((pass) => <PhienCanPanel catalog={catalog} key={pass.id} offline={offline} pass={pass} />)}
-        </div>
-      )}
     </section>
   );
 }

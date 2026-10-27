@@ -8,9 +8,20 @@ const STATUS_TEXT: Record<VerificationStatus, { icon: string; label: string }> =
   MISMATCH: { icon: "❌", label: "Không khớp" },
   NOT_IN_YARD: { icon: "🚫", label: "Không tìm thấy xe ở bãi" },
   WAITING_SECOND_WEIGH: { icon: "⏳", label: "Chờ cân lần 2" },
-  WAITING_WEIGHT: { icon: "⏳", label: "Chờ cân lần 1" }
+  WAITING_WEIGHT: { icon: "⏳", label: "Chờ cân lần 1" },
+  WAITING_CAPTURE: { icon: "📷", label: "Đang chờ ảnh chụp" },
+  CAPTURE_FAILED: { icon: "🔍", label: "Cần kiểm tra lại (ảnh chụp lỗi)" }
 };
-const STATUS_ORDER: VerificationStatus[] = ["VERIFIED", "REVIEW_REQUIRED", "MISMATCH", "NOT_IN_YARD", "WAITING_SECOND_WEIGH", "WAITING_WEIGHT"];
+const STATUS_ORDER: VerificationStatus[] = [
+  "VERIFIED",
+  "REVIEW_REQUIRED",
+  "MISMATCH",
+  "CAPTURE_FAILED",
+  "NOT_IN_YARD",
+  "WAITING_CAPTURE",
+  "WAITING_SECOND_WEIGH",
+  "WAITING_WEIGHT"
+];
 const MATERIAL_LABELS: Record<string, string> = { sand: "Cát", stone_2_3: "Đá 2–3", stone_4_6: "Đá 4–6", boulder: "Đá tảng", empty: "Không chở hàng" };
 
 export interface ReportOptions {

@@ -9,9 +9,10 @@ import { AssistantService } from "./assistant.service";
 import { MasterController } from "./master.controller";
 import { MasterDataService } from "./master-data.service";
 import { LiveController } from "./live.controller";
+import { DemoSeedService } from "./demo-seed.service";
 
 @Module({
   controllers: [GateController, LiveController, MasterController, TelegramController],
-  providers: [GatePassesService, GatePassRepository, WeighReadingRepository, MasterDataService, TelegramService, AssistantService]
+  providers: [GatePassesService, GatePassRepository, WeighReadingRepository, MasterDataService, TelegramService, AssistantService, DemoSeedService]
 })
 export class GateModule {}

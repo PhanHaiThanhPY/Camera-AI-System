@@ -13,7 +13,7 @@ Camera / video
   → React hiển thị realtime, người vận hành xác nhận/chốt phiếu
 ```
 
-Không lưu ảnh/video bằng chứng — mọi dữ liệu chỉ là số liệu (biển số, độ tin cậy, loại xe/vật liệu, khối lượng), lưu trong PostgreSQL qua Prisma. Cân giả lập tắt mặc định; chỉ bật `WEIGHBRIDGE_MOCK_RANDOM=true` khi chạy demo trước khi nối trạm cân thật.
+Số liệu (biển số, độ tin cậy, loại xe/vật liệu, khối lượng) lưu trong PostgreSQL qua Prisma; ảnh bằng chứng (crop vùng xe lúc nhận diện) lưu trên MinIO, chỉ link ảnh được ghép vào bản ghi. Cân giả lập tắt mặc định; chỉ bật `WEIGHBRIDGE_MOCK_RANDOM=true` khi chạy demo trước khi nối trạm cân thật.
 
 ## Cấu trúc — 3 lớp
 
@@ -43,6 +43,8 @@ pnpm dev                # chạy chung apps/api (NestJS) + apps/dashboard (Vite)
 
 Khi chạy demo không có trạm cân thật, tạo file `.env` từ `.env.example` và bật `WEIGHBRIDGE_MOCK_RANDOM=true`. Nếu triển khai thật, giữ giá trị này là `false` và đặt `WEIGHBRIDGE_API_KEY` cho endpoint trạm cân.
 
+Khi demo mà chưa có Postgres/camera/cân thật, đặt `DEMO_MODE=true` trong `.env` — API tự dựng một lô lượt xe mẫu (`apps/api/src/gate/demo-data.ts`) ngay khi khởi động, không cần `docker compose up -d` và không đụng tới DATABASE_URL. Mặc định `DEMO_MODE=false` chạy luồng thật với Postgres như bình thường.
+
 ## Cài đặt & chạy python/detect (độc lập)
 
 ```bash
@@ -50,10 +52,22 @@ python3 -m venv .venv
 .venv/bin/pip install -r python/requirements.txt
 python/scripts/download-models.sh
 
+export GATE_API_URL=http://localhost:4000/api
 .venv/bin/python python/detect/pipeline.py path/to/video.mp4 cam-01
 ```
 
-Mặc định chỉ in kết quả ra stdout (một dòng JSON mỗi lượt xe). Đặt `GATE_API_URL=http://localhost:4000/api` trong môi trường trước khi chạy để nó tự đẩy từng lượt sang `apps/api`. Chi tiết, biến môi trường: `python/README.md` và `.env.example`.
+Mỗi tiến trình là 1 camera, chạy theo mô hình cân-trước-chụp-sau: polling `apps/api` xem trạm cân
+(`CAPTURE_SCALE_ID`) vừa cân xong chưa, có tín hiệu mới chụp 1 khung và nhận diện — `GATE_API_URL`
+bắt buộc ở mode này (không có thì không biết lúc nào cần chụp). Chi tiết, biến môi trường:
+`python/README.md` và `.env.example`.
+
+## Đo tải hệ thống
+
+```bash
+scripts/measure.sh
+```
+
+In CPU/RAM của từng lớp (dashboard, api, python/detect, python/streamsim) + Postgres, và gọi `GET /api/health`, `GET /health` (streamsim). Nhận diện được cả tiến trình dev lẫn production — dùng y chang trên VPS, hoặc đo từ xa bằng `scripts/measure.sh --ssh user@vps-host`. Chi tiết: `ARCHITECTURE.md`.
 
 ## Tài liệu
 

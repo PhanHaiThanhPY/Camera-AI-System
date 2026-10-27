@@ -167,7 +167,20 @@ export function computeVisitStatus(pass: Pick<GatePass, "exitCapture" | "weighin
   return exitedByCamera || exitedByWeighing ? "EXITED" : "ENTERED";
 }
 
-export function deriveStatus(checks: VerificationCheck[], weighing: WeighSummary | null, master: MasterLink): VerificationStatus {
+export function deriveStatus(
+  checks: VerificationCheck[],
+  weighing: WeighSummary | null,
+  master: MasterLink,
+  captureState: GatePass["captureState"] = null
+): VerificationStatus {
+  // Đang chờ/chờ hết hạn ảnh chụp từ camera (luồng cân-trước-chụp-sau) — chưa có gì để kiểm tra chéo,
+  // ưu tiên hiển thị 2 trạng thái này trước mọi suy luận từ checks/master bình thường.
+  if (captureState === "pending") {
+    return "WAITING_CAPTURE";
+  }
+  if (captureState === "failed") {
+    return "CAPTURE_FAILED";
+  }
   if (master.match === "none") {
     return "NOT_IN_YARD";
   }
@@ -242,6 +255,10 @@ export function deriveReasons(status: VerificationStatus, checks: VerificationCh
       return ["Chưa có số liệu cân đầu vào."];
     case "WAITING_SECOND_WEIGH":
       return ["Xe đã vào bãi, đang chờ cân đầu ra."];
+    case "WAITING_CAPTURE":
+      return ["Đã cân xong, đang chờ camera chụp ảnh."];
+    case "CAPTURE_FAILED":
+      return ["Không có ảnh nào đọc được biển số rõ ràng (mờ hoặc không nhận diện được) — cần kiểm tra lại tại hiện trường hoặc nhập tay."];
     case "MISMATCH":
       return checks.filter((item) => item.result === "fail").map(describe);
     case "REVIEW_REQUIRED":
