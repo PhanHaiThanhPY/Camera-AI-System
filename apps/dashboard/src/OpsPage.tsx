@@ -4,9 +4,8 @@ import { useAuth } from "./AuthContext";
 import MasterPage from "./MasterPage";
 import { request } from "./PassDetail";
 import type { GatePass } from "./PassDetail";
-import SitesPage from "./SitesPage";
 
-type Tab = "overview" | "sites" | "master";
+type Tab = "overview" | "master";
 
 function StatBox({ label, value }: { label: string; value: string }): ReactElement {
   return <div className="stat-box"><p className="stat-label">{label}</p><p className="stat-value">{value}</p></div>;
@@ -54,7 +53,7 @@ function OverviewTab(): ReactElement {
   const maxTons = Math.max(1, ...production.map((item) => item.tons));
 
   if (sites.length === 0) {
-    return <p className="muted-text">Chưa có cơ sở nào — tạo cơ sở ở trang "Cơ sở" trước.</p>;
+    return <p className="muted-text">Chưa có cơ sở nào — tạo cơ sở ở trang "Cấu hình" trước.</p>;
   }
 
   return (
@@ -104,18 +103,17 @@ function OverviewTab(): ReactElement {
   );
 }
 
-/** Điều hành: báo cáo sản lượng/ngoại lệ theo cơ sở thật, tạo/sửa cơ sở, và danh mục xe/tài xế. */
+/** Điều hành: báo cáo sản lượng/ngoại lệ theo cơ sở thật, và danh mục xe/tài xế. Tạo/sửa cơ sở + camera
+ *  nằm ở trang riêng "Cấu hình" (xem ConfigPage.tsx), không còn là tab ở đây. */
 export default function OpsPage(): ReactElement {
   const [tab, setTab] = useState<Tab>("overview");
   return (
     <section className="main-column">
       <div className="panel gate-block ops-tabs">
         <button aria-pressed={tab === "overview"} className="tab-button" type="button" onClick={() => setTab("overview")}>Báo cáo</button>
-        <button aria-pressed={tab === "sites"} className="tab-button" type="button" onClick={() => setTab("sites")}>Cơ sở</button>
         <button aria-pressed={tab === "master"} className="tab-button" type="button" onClick={() => setTab("master")}>Danh mục xe &amp; tài xế</button>
       </div>
       {tab === "overview" && <OverviewTab />}
-      {tab === "sites" && <SitesPage />}
       {tab === "master" && <MasterPage />}
     </section>
   );

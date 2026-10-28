@@ -1,6 +1,7 @@
 import { ReactElement, useEffect, useState } from "react";
 import { useAuth } from "./AuthContext";
 import AccountsPage from "./AccountsPage";
+import ConfigPage from "./ConfigPage";
 import ConfirmPage from "./ConfirmPage";
 import CapturesTable from "./CapturesTable";
 import LivePage from "./LivePage";
@@ -8,24 +9,27 @@ import OpsPage from "./OpsPage";
 import PassPage from "./PassPage";
 import { useGateCatalog, useGateFeed } from "./PassDetail";
 
-type View = "live" | "confirm" | "table" | "ops" | "accounts";
-const VIEWS: View[] = ["live", "confirm", "table", "ops", "accounts"];
-/** Sidebar: bốn mục chuẩn theo sơ đồ trong proposal (trang 08–11) + "Quản lý tài khoản" (chỉ ADMIN,
- *  lọc ở renderNavItems). "Điều hành" gộp luôn tạo/sửa cơ sở + báo cáo + danh mục xe & tài xế (xem
- *  OpsPage.tsx) — không còn mục "Tài xế"/"Cơ sở" riêng ở sidebar. Bot Telegram chỉ cấu hình qua biến
- *  môi trường (TELEGRAM_BOT_TOKEN/DEEPSEEK_API_KEY) trên máy chủ API. */
+type View = "live" | "confirm" | "table" | "ops" | "config" | "accounts";
+const VIEWS: View[] = ["live", "confirm", "table", "ops", "config", "accounts"];
+/** Sidebar: các mục chuẩn theo sơ đồ trong proposal (trang 08–11) + "Cấu hình" (tạo/sửa cơ sở + camera,
+ *  tách riêng khỏi "Điều hành" — xem ConfigPage.tsx) + "Quản lý tài khoản" (chỉ ADMIN, lọc ở
+ *  renderNavItems). "Điều hành" chỉ còn báo cáo + danh mục xe & tài xế (xem OpsPage.tsx) — không còn mục
+ *  "Tài xế" riêng ở sidebar. Bot Telegram chỉ cấu hình qua biến môi trường (TELEGRAM_BOT_TOKEN/
+ *  DEEPSEEK_API_KEY) trên máy chủ API. */
 const NAV_ITEMS: { view: View; num: string; label: string; adminOnly?: true }[] = [
   { view: "live", num: "01", label: "Trạm cân trực tiếp" },
   { view: "confirm", num: "02", label: "Xác nhận vật liệu" },
   { view: "table", num: "03", label: "Sổ cân & truy vết" },
   { view: "ops", num: "04", label: "Điều hành" },
-  { view: "accounts", num: "05", label: "Quản lý tài khoản", adminOnly: true }
+  { view: "config", num: "05", label: "Cấu hình" },
+  { view: "accounts", num: "06", label: "Quản lý tài khoản", adminOnly: true }
 ];
 const VIEW_TITLES: Record<View, { title: string; subtitle: string }> = {
   live: { title: "Trạm cân trực tiếp", subtitle: "Theo dõi phiên cân đang diễn ra và ảnh chụp bằng chứng theo thời gian thực." },
   confirm: { title: "Nhận đúng nhóm hàng, kiểm soát riêng từng cấp đá", subtitle: "Tra nhãn vật liệu để phân loại đúng cấp đá/cát trước khi xác nhận." },
   table: { title: "Sổ cân & truy vết", subtitle: "Tìm, lọc và sửa lại các lượt cân đã ghi nhận." },
-  ops: { title: "Điều hành", subtitle: "Tạo/sửa cơ sở, xem báo cáo sản lượng và danh mục xe & tài xế." },
+  ops: { title: "Điều hành", subtitle: "Xem báo cáo sản lượng và danh mục xe & tài xế." },
+  config: { title: "Cấu hình", subtitle: "Chọn cơ sở để tạo/sửa cơ sở, đấu nối trạm cân và camera." },
   accounts: { title: "Quản lý tài khoản", subtitle: "Tạo và quản lý tài khoản đăng nhập cho nhân viên." }
 };
 
@@ -154,6 +158,7 @@ function App(): ReactElement {
             {view === "confirm" && <ConfirmPage />}
             {view === "table" && <CapturesTable onOpenPass={(id) => { window.location.hash = `/pass/${id}`; }} />}
             {view === "ops" && <OpsPage />}
+            {view === "config" && <ConfigPage />}
             {view === "accounts" && isAdmin && <AccountsPage />}
           </>
         )}

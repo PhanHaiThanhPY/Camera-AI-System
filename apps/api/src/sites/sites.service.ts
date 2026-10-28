@@ -69,6 +69,21 @@ export class SitesService implements OnModuleInit {
     }
     this.logger.log(`Đã nạp ${this.sites.size} cơ sở, ${this.cameras.size} camera.`);
     await this.backfillMissingSites();
+    await this.backfillMissingCameras();
+  }
+
+  /** Cơ sở tạo trước khi createSite() tự sinh 4 camera mặc định (hoặc lỗi lúc tạo) đang có 0 camera —
+   *  tự tạo đủ 4 góc, để ai cũng có sẵn chỗ nhập rtspUrl như cơ sở tạo mới. */
+  private async backfillMissingCameras(): Promise<void> {
+    const missing = [...this.sites.values()].filter((site) => this.camerasOf(site.id).length === 0);
+    for (const site of missing) {
+      try {
+        await this.createDefaultCameras(site.id);
+        this.logger.log(`Đã tự tạo 4 camera mặc định cho cơ sở "${site.name}" (chưa có khi tính năng này ra mắt).`);
+      } catch (error: unknown) {
+        this.logger.error(`Không tự tạo được camera mặc định cho cơ sở ${site.id}: ${String(error)}`);
+      }
+    }
   }
 
   /** Tài khoản USER tạo trước khi có tính năng Site (hoặc lỗi lúc tạo tự động) chưa có cơ sở nào —
@@ -175,7 +190,17 @@ export class SitesService implements OnModuleInit {
     const data = { ownerId, name: trimmed, scaleId, weighbridgeApiKey };
     const site: Site = isDemoMode() ? { id: randomUUID(), ...data, createdAt: now, updatedAt: now } : toDomainSite(await this.prisma.site.create({ data }));
     this.sites.set(site.id, site);
+    await this.createDefaultCameras(site.id);
     return site;
+  }
+
+  /** Mỗi cơ sở mặc định có sẵn 4 ô camera ("4 góc" — xem python/streamsim) để người vận hành chỉ cần
+   *  điền rtspUrl/label vào, không phải tự bấm "Thêm camera" 4 lần mới dùng được luồng cân-trước-chụp-sau
+   *  (CAPTURE_EXPECTED_SHOTS mặc định cũng là 4, khớp đúng số này). */
+  private async createDefaultCameras(siteId: string): Promise<void> {
+    for (let i = 1; i <= 4; i += 1) {
+      await this.addCamera(siteId, { label: `Góc ${i}` });
+    }
   }
 
   public async updateSite(id: string, input: SiteUpdateInput): Promise<Site> {

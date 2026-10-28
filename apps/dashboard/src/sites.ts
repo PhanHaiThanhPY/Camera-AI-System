@@ -46,10 +46,5 @@ export const deleteSite = (id: string): Promise<{ ok: true }> => sitesFetch<{ ok
 
 export const listCameras = (siteId: string): Promise<SiteCamera[]> => sitesFetch<SiteCamera[]>(`/${siteId}/cameras`);
 
-export const addCamera = (siteId: string, input: { label?: string; rtspUrl?: string }): Promise<SiteCamera> =>
-  sitesFetch<SiteCamera>(`/${siteId}/cameras`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
-
 export const updateCamera = (cameraRowId: string, input: { label?: string; rtspUrl?: string }): Promise<SiteCamera> =>
   sitesFetch<SiteCamera>(`/cameras/${cameraRowId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
-
-export const removeCamera = (cameraRowId: string): Promise<{ ok: true }> => sitesFetch<{ ok: true }>(`/cameras/${cameraRowId}`, { method: "DELETE" });

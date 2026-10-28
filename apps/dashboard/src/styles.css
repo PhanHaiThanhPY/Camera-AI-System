@@ -336,6 +336,10 @@ h3 { font-size: var(--text-md); font-weight: 600; line-height: var(--leading-snu
 .master-toolbar { align-items: center; display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
 .master-toolbar input[type=search] { background: #fff; border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--ink); flex: 1; min-width: 160px; padding: 9px 10px; }
 .master-toolbar .secondary-button, .master-toolbar .primary-button { margin-top: 0; padding: 9px 14px; width: auto; }
+.config-site-select { color: var(--muted); display: grid; font-size: var(--text-xs); font-weight: 600; gap: 6px; }
+.config-site-select select { background: #fff; border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--ink); font-size: var(--text-sm); font-weight: 400; min-width: 280px; padding: 9px 10px; }
+.config-page-head { align-items: center; border-bottom: 1px solid var(--border); display: flex; gap: 16px; justify-content: space-between; margin-top: var(--space-5); padding-bottom: var(--space-3); }
+.config-page-head h3 { margin: 0; }
 .master-form { background: #f0f3fa; border: 1px solid var(--border); border-radius: var(--radius-md); display: grid; gap: 10px; margin-top: 14px; padding: 14px; }
 .master-form label { color: var(--muted); display: grid; font-size: 11px; gap: 5px; }
 .master-form input, .master-form select { background: #fff; border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--ink); padding: 8px 10px; }
