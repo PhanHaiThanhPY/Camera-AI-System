@@ -74,3 +74,4 @@ In CPU/RAM của từng lớp (dashboard, api, python/detect, python/streamsim) 
 - Kiến trúc đầy đủ: `ARCHITECTURE.md`.
 - Nghiệp vụ cổng (trạng thái, kiểm tra chéo, master data, Telegram): `docs/gate-control-scope.md`.
 - Checklist kết nối camera Hikvision/RTSP thật: `docs/hikvision-rtsp-deployment.md`.
+- Checklist triển khai lên VPS (domain + HTTPS): `docs/deployment.md`.
