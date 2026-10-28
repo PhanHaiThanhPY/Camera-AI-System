@@ -10,5 +10,6 @@ python/models/*.pt
 python/streamsim/links.json
 *.pyc
 __pycache__/
+logs/
 
 .playwright-mcp/

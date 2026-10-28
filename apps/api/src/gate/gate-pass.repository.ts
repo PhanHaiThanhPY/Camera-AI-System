@@ -25,6 +25,7 @@ const jsonOrNull = (value: unknown): Prisma.InputJsonValue | typeof Prisma.DbNul
 function toDomain(row: GatePassRow): GatePass {
   return {
     id: row.id,
+    siteId: row.siteId,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     capture: row.capture as unknown as PlateCapture,
@@ -48,6 +49,7 @@ function toDomain(row: GatePassRow): GatePass {
 
 function toRowData(pass: GatePass): Omit<Prisma.GatePassUncheckedCreateInput, "id"> {
   return {
+    siteId: pass.siteId,
     capturedAt: new Date(pass.capture.capturedAt),
     plateNormalized: pass.capture.plateNormalized,
     status: pass.status,
@@ -93,22 +95,25 @@ export class GatePassRepository {
     return row === null ? null : toDomain(row);
   }
 
-  /** Toàn bộ lượt đang PENDING — tập hợp nhỏ dùng cho các thuật toán ghép và refreshAll. */
-  public async findPending(): Promise<GatePass[]> {
+  /** Toàn bộ lượt đang PENDING của 1 site (hoặc mọi site nếu không truyền — chỉ dùng nội bộ cho
+   *  refreshAllPending, không bao giờ lộ ra ngoài qua API) — tập hợp nhỏ dùng cho các thuật toán ghép. */
+  public async findPending(siteId?: string): Promise<GatePass[]> {
     if (isDemoMode()) {
-      return [...this.memory.values()].filter((pass) => pass.resolution === "PENDING");
+      return [...this.memory.values()].filter((pass) => pass.resolution === "PENDING" && (siteId === undefined || pass.siteId === siteId));
     }
-    const rows = await this.prisma.gatePass.findMany({ where: { resolution: "PENDING" } });
+    const rows = await this.prisma.gatePass.findMany({ where: { resolution: "PENDING", ...(siteId === undefined ? {} : { siteId }) } });
     return rows.map(toDomain);
   }
 
-  /** Danh sách lượt xe, mới nhất trước. */
-  public async list(options: { limit?: number } = {}): Promise<GatePass[]> {
+  /** Danh sách lượt xe, mới nhất trước. siteId=undefined (chỉ admin) = mọi site. */
+  public async list(options: { limit?: number; siteId?: string } = {}): Promise<GatePass[]> {
     if (isDemoMode()) {
-      const sorted = [...this.memory.values()].sort((first, second) => second.capture.capturedAt.localeCompare(first.capture.capturedAt));
+      const filtered = [...this.memory.values()].filter((pass) => options.siteId === undefined || pass.siteId === options.siteId);
+      const sorted = filtered.sort((first, second) => second.capture.capturedAt.localeCompare(first.capture.capturedAt));
       return options.limit === undefined ? sorted : sorted.slice(0, options.limit);
     }
     const rows = await this.prisma.gatePass.findMany({
+      where: options.siteId === undefined ? {} : { siteId: options.siteId },
       orderBy: { capturedAt: "desc" },
       take: options.limit
     });

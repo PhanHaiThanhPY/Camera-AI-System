@@ -9,9 +9,22 @@ import {
   HttpCode,
   Param,
   Post,
-  Query
+  Query,
+  Res,
+  UploadedFile,
+  UseInterceptors
 } from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import type { Response } from "express";
+import { CurrentUser } from "../auth/current-user.decorator";
+import { Public } from "../auth/public.decorator";
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { SitesService } from "../sites/sites.service";
+import type { SafeUser } from "../users/user.types";
 import { MATERIALS, VEHICLE_PROFILES } from "./gate.catalog";
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { GateExcelService } from "./gate-excel.service";
+import type { ImportRowError } from "./gate-excel.service";
 import type { CaptureShot, Classification, DetectionInput, GateOverrides, GatePass, WeighReading } from "./gate.types";
 // NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -63,8 +76,12 @@ function parseReading(body: JsonBody): ReadingInput {
   if (!Number.isFinite(Date.parse(measuredAt))) {
     throw new BadRequestException("measuredAt phải là ISO 8601.");
   }
+  const scaleId = optionalString(record, "scaleId");
+  if (scaleId === null) {
+    throw new BadRequestException("scaleId là bắt buộc — dùng đúng scaleId hiện ở trang Cơ sở.");
+  }
   return {
-    scaleId: optionalString(record, "scaleId") ?? "SCALE-01",
+    scaleId,
     ticketNo: optionalString(record, "ticketNo"),
     plateNumber: optionalString(record, "plateNumber"),
     grossKg,
@@ -185,7 +202,43 @@ function parseResolve(body: JsonBody): ResolveInput {
 
 @Controller("gate")
 export class GateController {
-  public constructor(private readonly gatePasses: GatePassesService) {}
+  public constructor(
+    private readonly gatePasses: GatePassesService,
+    private readonly sites: SitesService,
+    private readonly excel: GateExcelService
+  ) {}
+
+  /** File Excel mẫu để bảo vệ ghi lại các lượt cân tay lúc mất điện, nhập lại khi hệ thống chạy lại. */
+  @Get("import-template")
+  public async importTemplate(@Res() res: Response): Promise<void> {
+    const buffer = await this.excel.buildTemplate();
+    res.set({
+      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": 'attachment; filename="mau-nhap-lieu.xlsx"'
+    });
+    res.send(buffer);
+  }
+
+  /** Nhập các lượt đã ghi tay (cân xong cả hai đầu) từ file Excel vào đúng cơ sở đang chọn. */
+  @Post("passes/import")
+  @HttpCode(200)
+  @UseInterceptors(FileInterceptor("file", { limits: { fileSize: 5 * 1024 * 1024 } }))
+  public async importPasses(
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() user: SafeUser,
+    @Query("siteId") siteId?: string
+  ): Promise<{ imported: number; errors: ImportRowError[] }> {
+    if (file === undefined || file.buffer === undefined) {
+      throw new BadRequestException("Thiếu file — chọn file .xlsx đã điền trước khi nhập.");
+    }
+    const scope = this.sites.resolveSiteScope(user, siteId);
+    if ("allSites" in scope) {
+      throw new BadRequestException("Chọn 1 cơ sở cụ thể trước khi nhập Excel.");
+    }
+    const { rows, errors: parseErrors } = await this.excel.parseWorkbook(file.buffer);
+    const result = await this.gatePasses.importManualPasses(scope.siteId, rows, user.name);
+    return { imported: result.imported, errors: [...parseErrors, ...result.errors].sort((first, second) => first.row - second.row) };
+  }
 
   @Get("catalog")
   public catalog(): { vehicleTypes: { code: string; label: string }[]; materials: { code: string; label: string }[] } {
@@ -196,30 +249,33 @@ export class GateController {
   }
 
   @Get("passes")
-  public listPasses(): Promise<GatePass[]> {
-    return this.gatePasses.listPasses();
+  public listPasses(@CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<GatePass[]> {
+    return this.gatePasses.listPasses(this.sites.resolveSiteScope(user, siteId));
   }
 
   /** scope=resolved (mặc định) chỉ xoá lượt đã xác nhận/từ chối; scope=all xoá cả lượt đang chờ. */
   @Delete("passes")
-  public clear(@Query("scope") scope: string | undefined): Promise<{ removed: number }> {
+  public clear(@Query("scope") scope: string | undefined, @CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<{ removed: number }> {
     if (scope !== undefined && scope !== "resolved" && scope !== "all") {
       throw new BadRequestException("scope phải là resolved hoặc all.");
     }
-    return this.gatePasses.clear(scope ?? "resolved");
+    return this.gatePasses.clear(scope ?? "resolved", this.sites.resolveSiteScope(user, siteId));
   }
 
   @Delete("passes/:id")
-  public remove(@Param("id") id: string): Promise<{ removed: number }> {
-    return this.gatePasses.remove(id);
+  public remove(@Param("id") id: string, @CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<{ removed: number }> {
+    return this.gatePasses.remove(id, this.sites.resolveSiteScope(user, siteId));
   }
 
   @Get("passes/:id")
-  public getPass(@Param("id") id: string): Promise<GatePass> {
-    return this.gatePasses.getPass(id);
+  public getPass(@Param("id") id: string, @CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<GatePass> {
+    return this.gatePasses.getPass(id, this.sites.resolveSiteScope(user, siteId));
   }
 
-  /** Lớp Python (nhận diện biển số, phân loại xe/vật liệu) đẩy từng lượt nhận diện về đây. */
+  /** Lớp Python (nhận diện biển số, phân loại xe/vật liệu) đẩy từng lượt nhận diện về đây — máy gọi máy,
+   *  không qua cookie đăng nhập, nên phải @Public() (không có auth riêng, giữ như trước khi có đăng nhập).
+   *  Site tự suy ra từ cameraId (xem GatePassesService.ingestDetection). */
+  @Public()
   @Post("detections")
   @HttpCode(200)
   public ingestDetection(@Body() body: JsonBody): Promise<GatePass> {
@@ -228,46 +284,59 @@ export class GateController {
 
   @Post("passes/:id/confirm")
   @HttpCode(200)
-  public confirm(@Param("id") id: string, @Body() body: JsonBody): Promise<GatePass> {
-    return this.gatePasses.resolve(id, "CONFIRMED", parseResolve(body));
+  public confirm(@Param("id") id: string, @Body() body: JsonBody, @CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<GatePass> {
+    return this.gatePasses.resolve(id, "CONFIRMED", parseResolve(body), this.sites.resolveSiteScope(user, siteId));
   }
 
   @Post("passes/:id/reject")
   @HttpCode(200)
-  public reject(@Param("id") id: string, @Body() body: JsonBody): Promise<GatePass> {
-    return this.gatePasses.resolve(id, "REJECTED", parseResolve(body));
+  public reject(@Param("id") id: string, @Body() body: JsonBody, @CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<GatePass> {
+    return this.gatePasses.resolve(id, "REJECTED", parseResolve(body), this.sites.resolveSiteScope(user, siteId));
   }
 
   @Post("passes/:id/link-reading")
   @HttpCode(200)
-  public linkReading(@Param("id") id: string, @Body() body: JsonBody): Promise<GatePass> {
+  public linkReading(@Param("id") id: string, @Body() body: JsonBody, @CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<GatePass> {
     const record = asRecord(body);
     const readingId = optionalString(record, "readingId");
     if (readingId === null) {
       throw new BadRequestException("readingId là bắt buộc.");
     }
-    return this.gatePasses.linkReading(id, readingId, optionalString(record, "actor") ?? "operator", optionalString(record, "reason"));
+    return this.gatePasses.linkReading(
+      id,
+      readingId,
+      optionalString(record, "actor") ?? "operator",
+      optionalString(record, "reason"),
+      this.sites.resolveSiteScope(user, siteId)
+    );
   }
 
   @Get("readings")
-  public listReadings(): Promise<WeighReading[]> {
-    return this.gatePasses.listReadings();
+  public listReadings(@CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<WeighReading[]> {
+    return this.gatePasses.listReadings(this.sites.resolveSiteScope(user, siteId));
   }
 
   /** Hệ thống cân bên ngoài đẩy số liệu về đây — ghép theo trạm cân rồi mở ngay một đợt chờ ảnh camera
-   *  (xem GatePassesService.ingestReading). Đặt WEIGHBRIDGE_API_KEY để yêu cầu header X-Weighbridge-Key. */
+   *  (xem GatePassesService.ingestReading). Site tự suy ra từ scaleId; X-Weighbridge-Key so với đúng
+   *  weighbridgeApiKey của site đó (không còn WEIGHBRIDGE_API_KEY global). Máy gọi máy, không qua cookie. */
+  @Public()
   @Post("weighbridge/readings")
   @HttpCode(201)
   public ingest(@Headers("x-weighbridge-key") key: string | undefined, @Body() body: JsonBody): Promise<WeighReading> {
-    const expected = process.env.WEIGHBRIDGE_API_KEY;
-    if (expected !== undefined && expected !== "" && key !== expected) {
+    const input = parseReading(body);
+    const site = this.sites.resolveByScaleId(input.scaleId);
+    if (site === undefined) {
+      throw new BadRequestException(`scaleId "${input.scaleId}" chưa đăng ký cho cơ sở nào.`);
+    }
+    if (site.weighbridgeApiKey !== key) {
       throw new ForbiddenException("API key trạm cân không hợp lệ.");
     }
-    return this.gatePasses.ingestReading(parseReading(body));
+    return this.gatePasses.ingestReading(input);
   }
 
   /** Mỗi tiến trình camera (python/detect/pipeline.py, 1 process = 1 camera) polling cái này để biết có cần
-   *  chụp ngay không — xem GatePassesService.findPendingCaptureByScale. */
+   *  chụp ngay không — xem GatePassesService.findPendingCaptureByScale. Máy gọi máy, không qua cookie. */
+  @Public()
   @Get("capture-requests/pending")
   public pendingCapture(@Query("scaleId") scaleId: string | undefined): Promise<{ passId: string; deadlineAt: string } | null> {
     if (scaleId === undefined || scaleId.trim() === "") {
@@ -276,17 +345,24 @@ export class GateController {
     return this.gatePasses.findPendingCaptureByScale(scaleId.trim());
   }
 
-  /** Một camera trả kết quả chụp cho đợt chờ ảnh đang mở của lượt xe `id`. */
+  /** Một camera trả kết quả chụp cho đợt chờ ảnh đang mở của lượt xe `id`. Máy gọi máy, không qua cookie. */
+  @Public()
   @Post("passes/:id/capture-result")
   @HttpCode(200)
   public captureResult(@Param("id") id: string, @Body() body: JsonBody): Promise<GatePass> {
     return this.gatePasses.submitCaptureResult(id, parseCaptureShot(body));
   }
 
-  /** Demo/thử nghiệm: mô phỏng cân + chụp (nút "Mô phỏng cân + chụp" ở dashboard) — đi qua đúng luồng thật. */
+  /** Demo/thử nghiệm: mô phỏng cân + chụp (nút "Mô phỏng cân + chụp" ở dashboard) — đi qua đúng luồng thật,
+   *  trong đúng cơ sở người dùng đang chọn (siteId bắt buộc với USER có >1 cơ sở; ADMIN phải chọn 1 site cụ
+   *  thể, không mô phỏng được ở "Tất cả"). */
   @Post("simulate/weigh-and-capture")
   @HttpCode(200)
-  public simulate(): Promise<GatePass> {
-    return this.gatePasses.simulateWeighAndCapture();
+  public simulate(@CurrentUser() user: SafeUser, @Query("siteId") siteId?: string): Promise<GatePass> {
+    const scope = this.sites.resolveSiteScope(user, siteId);
+    if ("allSites" in scope) {
+      throw new BadRequestException("Chọn 1 cơ sở cụ thể trước khi mô phỏng cân + chụp.");
+    }
+    return this.gatePasses.simulateWeighAndCapture({ scaleId: this.sites.getSite(scope.siteId).scaleId });
   }
 }

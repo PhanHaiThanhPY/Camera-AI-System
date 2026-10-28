@@ -1,21 +1,10 @@
 import { Injectable, Logger } from "@nestjs/common";
-import { MATERIALS, VEHICLE_PROFILES } from "./gate.catalog";
 // NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { GatePassRepository } from "./gate-pass.repository";
-// NestJS needs the runtime class token for constructor dependency injection.
+import { GatePassesService } from "./gate-passes.service";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { MasterDataService } from "./master-data.service";
-import { dateInZone } from "./telegram.report";
-import type { GatePass, Resolution, VerificationStatus } from "./gate.types";
-
-const DEEPSEEK_API_BASE = "https://api.deepseek.com/chat/completions";
-const MAX_TOOL_ROUNDS = 4;
-const MAX_HISTORY_TURNS = 8;
-
-const MATERIAL_LABEL = new Map(MATERIALS.map((item) => [item.code, item.label]));
-const VEHICLE_LABEL = new Map(VEHICLE_PROFILES.map((item) => [item.code, item.label]));
-const labelOf = (map: Map<string, string>, code: string | null): string => (code === null ? "Chưa xác định" : (map.get(code) ?? code));
+import type { GatePass } from "./gate.types";
 
 interface ToolCall {
   id: string;
@@ -23,16 +12,12 @@ interface ToolCall {
   function: { name: string; arguments: string };
 }
 
-/** Format OpenAI-compatible (DeepSeek Chat Completions) — khác Anthropic Messages API: system là 1 message thường, tool call/result đi qua role "assistant"/"tool". */
 interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
-}
-
-interface ChatCompletionResponse {
-  choices: { message: { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }; finish_reason: string }[];
+  name?: string;
 }
 
 const TOOLS = [
@@ -40,15 +25,12 @@ const TOOLS = [
     type: "function",
     function: {
       name: "get_passes_summary",
-      description:
-        "Tổng hợp số lượt xe, khối lượng hàng, trạng thái kiểm tra chéo và quyết định xử lý trong một khoảng ngày (theo múi giờ báo cáo của hệ thống). Dùng cho câu hỏi kiểu 'hôm nay có bao nhiêu xe', 'tổng khối lượng tuần này', 'bao nhiêu lượt cần xem lại'.",
+      description: "Tổng hợp số liệu lượt xe ra/vào trong một ngày: tổng số lượt, tổng khối lượng (kg), số lượt theo trạng thái xử lý.",
       parameters: {
         type: "object",
         properties: {
-          fromDate: { type: "string", description: "Ngày bắt đầu, dạng yyyy-mm-dd." },
-          toDate: { type: "string", description: "Ngày kết thúc (bao gồm), dạng yyyy-mm-dd. Bằng fromDate nếu chỉ hỏi một ngày." }
-        },
-        required: ["fromDate", "toDate"]
+          date: { type: "string", description: "Ngày yyyy-mm-dd theo giờ Việt Nam. Bỏ trống nghĩa là hôm nay." }
+        }
       }
     }
   },
@@ -56,18 +38,14 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_passes",
-      description:
-        "Danh sách chi tiết từng lượt xe trong khoảng ngày, lọc được theo trạng thái kiểm tra chéo hoặc quyết định xử lý. Dùng khi cần liệt kê cụ thể (xe nào chưa xử lý, xe nào không khớp, biển số và giờ vào/ra).",
+      description: "Danh sách lượt xe gần đây, có thể lọc theo biển số (gần đúng) hoặc trạng thái xử lý.",
       parameters: {
         type: "object",
         properties: {
-          fromDate: { type: "string", description: "Ngày bắt đầu, dạng yyyy-mm-dd." },
-          toDate: { type: "string", description: "Ngày kết thúc (bao gồm), dạng yyyy-mm-dd." },
-          status: { type: "string", enum: ["VERIFIED", "REVIEW_REQUIRED", "MISMATCH", "NOT_IN_YARD", "WAITING_SECOND_WEIGH", "WAITING_WEIGHT", "WAITING_CAPTURE", "CAPTURE_FAILED"], description: "Lọc theo trạng thái kiểm tra chéo (tuỳ chọn)." },
-          resolution: { type: "string", enum: ["PENDING", "CONFIRMED", "REJECTED"], description: "Lọc theo quyết định người vận hành (tuỳ chọn)." },
-          limit: { type: "number", description: "Số dòng tối đa trả về, mặc định 50, tối đa 200." }
-        },
-        required: ["fromDate", "toDate"]
+          plateNumber: { type: "string", description: "Lọc theo biển số (chứa chuỗi này)." },
+          resolution: { type: "string", enum: ["PENDING", "CONFIRMED", "REJECTED"], description: "Lọc theo trạng thái xử lý." },
+          limit: { type: "number", description: "Tối đa bao nhiêu lượt trả về, mặc định 10, tối đa 30." }
+        }
       }
     }
   },
@@ -75,232 +53,196 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_vehicles",
-      description: "Danh mục xe và tài xế đã đăng ký trong bãi (master data). Dùng khi hỏi về một xe/tài xế cụ thể, hoặc tổng số xe đã đăng ký.",
+      description: "Danh sách xe trong master data (tất cả đối tác), kèm tài xế đang gắn với từng xe.",
       parameters: {
         type: "object",
-        properties: { search: { type: "string", description: "Lọc theo biển số hoặc tên tài xế chứa chuỗi này (tuỳ chọn, không phân biệt hoa thường)." } }
+        properties: {
+          plateNumber: { type: "string", description: "Lọc theo biển số (chứa chuỗi này)." }
+        }
       }
     }
   }
 ] as const;
 
-function systemPrompt(timeZone: string): string {
-  const now = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", weekday: "long", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
-  return [
-    "Bạn là trợ lý phân tích dữ liệu cho hệ thống kiểm soát xe & vật liệu tại một mỏ đá (Camera AI System).",
-    `Thời điểm hiện tại: ${now} (múi giờ ${timeZone}). Dùng để tính 'hôm nay', 'hôm qua', 'tuần này' thành ngày yyyy-mm-dd cụ thể khi gọi công cụ.`,
-    "Luôn gọi công cụ để lấy số liệu thật trước khi trả lời câu hỏi về dữ liệu — không tự bịa số.",
-    "Trả lời ngắn gọn, rõ ràng bằng tiếng Việt, phù hợp để đọc trong một tin nhắn Telegram. Không dùng cú pháp Markdown (không **, không #, không bảng) vì tin nhắn gửi dạng chữ thường; dùng gạch đầu dòng bằng ký tự • hoặc số thứ tự nếu cần liệt kê, và có thể dùng emoji vừa phải cho dễ đọc.",
-    "Nếu câu hỏi không liên quan tới hệ thống xe/vật liệu/mỏ đá, trả lời ngắn rằng bạn chỉ hỗ trợ hỏi đáp về dữ liệu hệ thống này."
-  ].join("\n");
-}
+const SYSTEM_PROMPT =
+  "Bạn là trợ lý vận hành trạm cân xe của hệ thống Camera AI System, trả lời bằng tiếng Việt, ngắn gọn, đi thẳng vào số liệu. " +
+  "CHỈ dùng dữ liệu lấy được từ các tool được cung cấp — tuyệt đối không tự bịa số liệu. " +
+  "Nếu tool không trả về gì liên quan tới câu hỏi, nói rõ là không tìm thấy, không suy đoán thêm.";
 
-/** Trợ lý AI (DeepSeek) trả lời câu hỏi tự do về dữ liệu hệ thống, dùng trong Telegram — xem TelegramService. */
+const MAX_TOOL_ROUNDS = 4;
+/** Giữ system + tối đa bấy nhiêu message gần nhất mỗi chat, tránh lịch sử phình to vô hạn theo thời gian. */
+const MAX_HISTORY_MESSAGES = 20;
+
+/**
+ * Cầu nối Telegram ↔ DeepSeek ↔ dữ liệu nghiệp vụ. DeepSeek chỉ là API chat văn bản, không có cách nào tự
+ * kết nối vào Postgres của mình — và cũng không nên cho một API key của bên thứ ba quyền đó. Vì vậy mọi câu
+ * hỏi đi qua một vòng "tool calling" chuẩn OpenAI-compatible: gửi câu hỏi + danh sách tool (hàm) kèm mô tả
+ * cho DeepSeek, nếu nó cần dữ liệu thì trả về yêu cầu gọi tool (không tự lấy được), SERVER này mới là nơi
+ * thực sự chạy hàm đó trên dữ liệu thật rồi đưa kết quả về cho DeepSeek viết câu trả lời cuối cùng.
+ * Lịch sử hội thoại giữ theo từng chatId (bộ nhớ, mất khi restart) — /reset ở TelegramService xoá thủ công.
+ */
 @Injectable()
 export class AssistantService {
   private readonly logger = new Logger(AssistantService.name);
-  private readonly timeZone = process.env.REPORT_TIMEZONE ?? "Asia/Ho_Chi_Minh";
-  /** Chỉ lưu các lượt user/assistant đã xong (text thường) — không lưu tool_calls giữa chừng, nên tương thích luôn giữa các provider. */
   private readonly history = new Map<string, ChatMessage[]>();
 
   public constructor(
-    private readonly passes: GatePassRepository,
+    private readonly passes: GatePassesService,
     private readonly master: MasterDataService
   ) {}
 
-  public get configured(): boolean {
+  /** true khi đã đặt DEEPSEEK_API_KEY — TelegramService dùng để quyết có xử lý tin nhắn tự do hay không. */
+  public get enabled(): boolean {
     return (process.env.DEEPSEEK_API_KEY ?? "") !== "";
   }
 
-  public resetHistory(sessionId: string): void {
-    this.history.delete(sessionId);
+  public reset(chatId: string): void {
+    this.history.delete(chatId);
   }
 
-  /** Trả lời một câu hỏi trong phiên `sessionId` (một chat Telegram); giữ vài lượt hội thoại gần nhất làm ngữ cảnh. */
-  public async reply(sessionId: string, userText: string): Promise<string> {
+  public async ask(chatId: string, question: string): Promise<string> {
     const apiKey = process.env.DEEPSEEK_API_KEY ?? "";
     if (apiKey === "") {
-      return "Trợ lý AI chưa được cấu hình (thiếu DEEPSEEK_API_KEY trên máy chủ). Báo quản trị viên đặt biến môi trường này rồi khởi động lại API.";
+      return "Chưa cấu hình DEEPSEEK_API_KEY trên máy chủ.";
     }
+    const conversation = this.history.get(chatId) ?? [{ role: "system", content: SYSTEM_PROMPT }];
+    conversation.push({ role: "user", content: question });
 
-    const priorTurns = this.history.get(sessionId) ?? [];
-    const messages: ChatMessage[] = [{ role: "system", content: systemPrompt(this.timeZone) }, ...priorTurns, { role: "user", content: userText }];
-
-    try {
-      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-        const message = await this.callDeepSeek(apiKey, messages);
-        const toolCalls = message.tool_calls ?? [];
-        if (toolCalls.length === 0) {
-          const text = (message.content ?? "").trim();
-          const finalText = text === "" ? "Xin lỗi, tôi chưa có câu trả lời phù hợp cho câu hỏi này." : text;
-          this.saveTurn(sessionId, userText, finalText);
-          return finalText;
-        }
-
-        messages.push({ role: "assistant", content: message.content, tool_calls: toolCalls });
-        for (const call of toolCalls) {
-          const input = parseToolArguments(call.function.arguments);
-          const result = await this.runTool(call.function.name, input);
-          messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
-        }
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+      const message = await this.callDeepSeek(apiKey, conversation);
+      conversation.push(message);
+      if (message.tool_calls === undefined || message.tool_calls.length === 0) {
+        this.history.set(chatId, trimHistory(conversation));
+        return message.content;
       }
-      return "Câu hỏi này cần tra cứu quá nhiều bước, bạn hỏi cụ thể hơn giúp tôi nhé (ví dụ thu hẹp theo ngày).";
-    } catch (error: unknown) {
-      this.logger.error("assistant reply failed", error instanceof Error ? error.stack : undefined);
-      return "Có lỗi khi gọi trợ lý AI, thử lại sau ít phút giúp tôi.";
+      for (const call of message.tool_calls) {
+        const result = await this.runTool(call.function.name, safeParseArgs(call.function.arguments));
+        conversation.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result) });
+      }
     }
+    this.history.set(chatId, trimHistory(conversation));
+    return "Câu hỏi này cần quá nhiều bước để trả lời — thử hỏi cụ thể hơn (ví dụ theo ngày hoặc theo biển số).";
   }
 
-  private saveTurn(sessionId: string, userText: string, assistantText: string): void {
-    const turns = this.history.get(sessionId) ?? [];
-    turns.push({ role: "user", content: userText }, { role: "assistant", content: assistantText });
-    this.history.set(sessionId, turns.slice(-MAX_HISTORY_TURNS * 2));
-  }
-
-  private async callDeepSeek(apiKey: string, messages: ChatMessage[]): Promise<{ content: string | null; tool_calls?: ToolCall[] }> {
-    const response = await fetch(DEEPSEEK_API_BASE, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: process.env.DEEPSEEK_MODEL ?? "deepseek-chat",
-        max_tokens: 1024,
-        tools: TOOLS,
-        tool_choice: "auto",
-        messages
-      }),
-      signal: AbortSignal.timeout(30_000)
-    });
-    const payload = (await response.json().catch(() => null)) as (ChatCompletionResponse & { error?: { message?: string } }) | null;
-    if (!response.ok || payload === null) {
-      throw new Error(`DeepSeek API lỗi: ${payload?.error?.message ?? `HTTP ${response.status}`}`);
-    }
-    const choice = payload.choices[0];
-    if (choice === undefined) {
-      throw new Error("DeepSeek API không trả về kết quả.");
-    }
-    return choice.message;
-  }
-
-  private async runTool(name: string, input: Record<string, unknown>): Promise<unknown> {
+  private async runTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     try {
       switch (name) {
         case "get_passes_summary":
-          return await this.toolGetPassesSummary(input);
+          return await this.toolPassesSummary(typeof args.date === "string" ? args.date : undefined);
         case "list_passes":
-          return await this.toolListPasses(input);
+          return await this.toolListPasses(args);
         case "list_vehicles":
-          return this.toolListVehicles(input);
+          return this.toolListVehicles(typeof args.plateNumber === "string" ? args.plateNumber : undefined);
         default:
-          return { error: `Không có công cụ tên ${name}.` };
+          return { error: `Không có tool "${name}".` };
       }
-    } catch (error: unknown) {
-      return { error: error instanceof Error ? error.message : "Lỗi không xác định khi tra cứu dữ liệu." };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Lỗi không xác định." };
     }
   }
 
-  /** Lượt có capturedAt rơi vào [fromDate, toDate] (bao gồm cả hai đầu) theo múi giờ báo cáo. */
-  private async passesInRange(fromDate: string, toDate: string): Promise<GatePass[]> {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
-      throw new Error("fromDate/toDate phải có dạng yyyy-mm-dd.");
+  private async toolPassesSummary(date?: string): Promise<unknown> {
+    const all = await this.passes.listPasses({ allSites: true });
+    const day = date ?? localDate(new Date());
+    const inDay = all.filter((pass) => localDate(new Date(pass.capture.capturedAt)) === day);
+    const totalNetKg = inDay.reduce((sum, pass) => sum + (pass.weighing?.netKg ?? 0), 0);
+    const byResolution: Record<GatePass["resolution"], number> = { PENDING: 0, CONFIRMED: 0, REJECTED: 0 };
+    for (const pass of inDay) {
+      byResolution[pass.resolution] += 1;
     }
-    const from = new Date(`${fromDate}T00:00:00Z`);
-    from.setUTCDate(from.getUTCDate() - 1);
-    const to = new Date(`${toDate}T00:00:00Z`);
-    to.setUTCDate(to.getUTCDate() + 2);
-    const candidates = await this.passes.listByCapturedRange(from, to);
-    return candidates.filter((pass) => {
-      const day = dateInZone(pass.capture.capturedAt, this.timeZone);
-      return day >= fromDate && day <= toDate;
-    });
+    return { ngay: day, tongLuot: inDay.length, tongNetKg: totalNetKg, theoXuLy: byResolution };
   }
 
-  private async toolGetPassesSummary(input: Record<string, unknown>): Promise<unknown> {
-    const fromDate = String(input.fromDate ?? "");
-    const toDate = String(input.toDate ?? "");
-    const passes = await this.passesInRange(fromDate, toDate);
-    const byStatus: Partial<Record<VerificationStatus, number>> = {};
-    const byResolution: Partial<Record<Resolution, number>> = {};
-    const byMaterial: Record<string, { trips: number; netKg: number }> = {};
-    let totalNetKg = 0;
-    let entered = 0;
-    let exited = 0;
-    for (const pass of passes) {
-      byStatus[pass.status] = (byStatus[pass.status] ?? 0) + 1;
-      byResolution[pass.resolution] = (byResolution[pass.resolution] ?? 0) + 1;
-      const materialLabel = labelOf(MATERIAL_LABEL, pass.effective.material);
-      const entry = byMaterial[materialLabel] ?? { trips: 0, netKg: 0 };
-      entry.trips += 1;
-      entry.netKg += pass.weighing?.netKg ?? 0;
-      byMaterial[materialLabel] = entry;
-      totalNetKg += pass.weighing?.netKg ?? 0;
-      if (pass.visitStatus === "EXITED") {
-        exited += 1;
-      } else {
-        entered += 1;
-      }
-    }
-    return {
-      fromDate,
-      toDate,
-      totalTrips: passes.length,
-      totalNetKg,
-      totalNetTons: Math.round((totalNetKg / 1000) * 100) / 100,
-      xeDangTrongBai: entered,
-      xeDaRaKhoiBai: exited,
-      theoTrangThaiKiemTra: byStatus,
-      theoQuyetDinhXuLy: byResolution,
-      theoLoaiVatLieu: byMaterial
-    };
-  }
-
-  private async toolListPasses(input: Record<string, unknown>): Promise<unknown> {
-    const fromDate = String(input.fromDate ?? "");
-    const toDate = String(input.toDate ?? "");
-    const status = typeof input.status === "string" ? (input.status as VerificationStatus) : undefined;
-    const resolution = typeof input.resolution === "string" ? (input.resolution as Resolution) : undefined;
-    const limit = Math.min(typeof input.limit === "number" ? input.limit : 50, 200);
-    let passes = await this.passesInRange(fromDate, toDate);
-    if (status !== undefined) {
-      passes = passes.filter((pass) => pass.status === status);
-    }
-    if (resolution !== undefined) {
-      passes = passes.filter((pass) => pass.resolution === resolution);
-    }
-    const total = passes.length;
-    const items = passes.slice(0, limit).map((pass) => ({
-      bienSo: pass.effective.plateNumber,
-      thoiGian: pass.capture.capturedAt,
-      loaiXe: labelOf(VEHICLE_LABEL, pass.effective.vehicleType),
-      vatLieu: labelOf(MATERIAL_LABEL, pass.effective.material),
-      hangKg: pass.weighing?.netKg ?? null,
-      trangThaiKiemTra: pass.status,
-      quyetDinh: pass.resolution,
-      lyDo: pass.statusReasons.join("; ") || null
-    }));
-    return { total, traVe: items.length, items };
-  }
-
-  private toolListVehicles(input: Record<string, unknown>): unknown {
-    const search = typeof input.search === "string" ? input.search.trim().toLowerCase() : "";
-    const vehicles = this.master.listVehicles();
-    const filtered = search === "" ? vehicles : vehicles.filter((vehicle) => vehicle.plateNumber.toLowerCase().includes(search) || vehicle.drivers.some((driver) => driver.fullName.toLowerCase().includes(search)));
+  private async toolListPasses(args: Record<string, unknown>): Promise<unknown> {
+    const all = await this.passes.listPasses({ allSites: true });
+    const plateFilter = typeof args.plateNumber === "string" ? args.plateNumber.trim().toLowerCase() : undefined;
+    const resolutionFilter = typeof args.resolution === "string" ? args.resolution : undefined;
+    const limit = typeof args.limit === "number" ? Math.min(Math.max(1, Math.trunc(args.limit)), 30) : 10;
+    const filtered = all
+      .filter((pass) => plateFilter === undefined || plateFilter === "" || pass.effective.plateNumber.toLowerCase().includes(plateFilter))
+      .filter((pass) => resolutionFilter === undefined || pass.resolution === resolutionFilter)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit);
     return {
       total: filtered.length,
-      items: filtered.slice(0, 100).map((vehicle) => ({
-        bienSo: vehicle.plateNumber,
-        loaiXe: labelOf(VEHICLE_LABEL, vehicle.vehicleType),
-        ghiChu: vehicle.note || null,
-        taiXe: vehicle.drivers.map((driver) => ({ hoTen: driver.fullName, soDienThoai: driver.phone || null, laTaiXeChinh: driver.isPrimary }))
+      items: filtered.map((pass) => ({
+        bienSo: pass.effective.plateNumber,
+        loaiXe: pass.effective.vehicleType,
+        vatLieu: pass.effective.material,
+        trangThai: pass.status,
+        xuLy: pass.resolution,
+        netKg: pass.weighing?.netKg ?? null,
+        vaoLuc: pass.capture.capturedAt,
+        raLuc: pass.exitCapture?.capturedAt ?? null
       }))
     };
   }
+
+  private toolListVehicles(plateNumber?: string): unknown {
+    const all = this.master.listAllVehiclesAcrossOwners();
+    const filter = plateNumber?.trim().toLowerCase();
+    const filtered = filter === undefined || filter === "" ? all : all.filter((vehicle) => vehicle.plateNumber.toLowerCase().includes(filter));
+    return {
+      total: filtered.length,
+      items: filtered.slice(0, 30).map((vehicle) => ({
+        bienSo: vehicle.plateNumber,
+        loaiXe: vehicle.vehicleType,
+        ghiChu: vehicle.note,
+        taiXe: vehicle.drivers.map((driver) => ({ hoTen: driver.fullName, soDienThoai: driver.phone, laTaiXeChinh: driver.isPrimary }))
+      }))
+    };
+  }
+
+  private async callDeepSeek(apiKey: string, messages: ChatMessage[]): Promise<ChatMessage> {
+    const model = process.env.DEEPSEEK_MODEL ?? "deepseek-chat";
+    const base = process.env.DEEPSEEK_API_BASE ?? "https://api.deepseek.com";
+    let response: Response;
+    try {
+      response = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages, tools: TOOLS, tool_choice: "auto" }),
+        signal: AbortSignal.timeout(30_000)
+      });
+    } catch {
+      throw new Error("Không kết nối được tới DeepSeek. Kiểm tra mạng của máy chủ.");
+    }
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      this.logger.warn(`deepseek rejected HTTP ${response.status}: ${body.slice(0, 200)}`);
+      throw new Error(`DeepSeek từ chối yêu cầu (HTTP ${response.status}).`);
+    }
+    const payload = (await response.json()) as { choices?: { message?: ChatMessage }[] };
+    const message = payload.choices?.[0]?.message;
+    if (message === undefined) {
+      throw new Error("DeepSeek không trả về câu trả lời.");
+    }
+    return message;
+  }
 }
 
-function parseToolArguments(raw: string): Record<string, unknown> {
+function localDate(date: Date): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: process.env.REPORT_TIMEZONE ?? "Asia/Ho_Chi_Minh",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  return formatter.format(date);
+}
+
+function safeParseArgs(raw: string): Record<string, unknown> {
   try {
-    const parsed: unknown = JSON.parse(raw === "" ? "{}" : raw);
+    const parsed: unknown = JSON.parse(raw);
     return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
   } catch {
     return {};
   }
+}
+
+function trimHistory(conversation: ChatMessage[]): ChatMessage[] {
+  if (conversation.length <= MAX_HISTORY_MESSAGES + 1) {
+    return conversation;
+  }
+  return [conversation[0], ...conversation.slice(-MAX_HISTORY_MESSAGES)];
 }

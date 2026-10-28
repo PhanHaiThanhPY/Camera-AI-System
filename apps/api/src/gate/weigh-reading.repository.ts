@@ -10,6 +10,7 @@ import type { WeighReading } from "./gate.types";
 function toDomain(row: WeighReadingRow): WeighReading {
   return {
     id: row.id,
+    siteId: row.siteId,
     scaleId: row.scaleId,
     ticketNo: row.ticketNo,
     plateNumber: row.plateNumber,
@@ -33,6 +34,7 @@ export class WeighReadingRepository {
     if (isDemoMode()) {
       const reading: WeighReading = {
         id: randomUUID(),
+        siteId: input.siteId,
         scaleId: input.scaleId,
         ticketNo: input.ticketNo,
         plateNumber: input.plateNumber,
@@ -48,6 +50,7 @@ export class WeighReadingRepository {
     }
     const row = await this.prisma.weighReading.create({
       data: {
+        siteId: input.siteId,
         scaleId: input.scaleId,
         ticketNo: input.ticketNo,
         plateNumber: input.plateNumber,
@@ -68,12 +71,12 @@ export class WeighReadingRepository {
     return row === null ? null : toDomain(row);
   }
 
-  /** Số liệu cân chưa ghép vào lượt xe nào — tập nhỏ, dùng khi một lượt mới vừa được tạo. */
-  public async findUnattached(): Promise<WeighReading[]> {
+  /** Số liệu cân chưa ghép vào lượt xe nào, trong đúng 1 site — tập nhỏ, dùng khi một lượt mới vừa tạo. */
+  public async findUnattached(siteId: string): Promise<WeighReading[]> {
     if (isDemoMode()) {
-      return [...this.memory.values()].filter((reading) => reading.gatePassId === null);
+      return [...this.memory.values()].filter((reading) => reading.gatePassId === null && reading.siteId === siteId);
     }
-    const rows = await this.prisma.weighReading.findMany({ where: { gatePassId: null } });
+    const rows = await this.prisma.weighReading.findMany({ where: { gatePassId: null, siteId } });
     return rows.map(toDomain);
   }
 
@@ -88,11 +91,16 @@ export class WeighReadingRepository {
     await this.prisma.weighReading.update({ where: { id }, data: { gatePassId } });
   }
 
-  public async list(limit = 200): Promise<WeighReading[]> {
+  public async list(limit = 200, siteId?: string): Promise<WeighReading[]> {
     if (isDemoMode()) {
-      return [...this.memory.values()].sort((first, second) => second.receivedAt.localeCompare(first.receivedAt)).slice(0, limit);
+      const filtered = [...this.memory.values()].filter((reading) => siteId === undefined || reading.siteId === siteId);
+      return filtered.sort((first, second) => second.receivedAt.localeCompare(first.receivedAt)).slice(0, limit);
     }
-    const rows = await this.prisma.weighReading.findMany({ orderBy: { receivedAt: "desc" }, take: limit });
+    const rows = await this.prisma.weighReading.findMany({
+      where: siteId === undefined ? {} : { siteId },
+      orderBy: { receivedAt: "desc" },
+      take: limit
+    });
     return rows.map(toDomain);
   }
 
@@ -109,11 +117,19 @@ export class WeighReadingRepository {
     await this.prisma.weighReading.deleteMany({ where: { id: { in: ids } } });
   }
 
-  public async deleteAll(): Promise<void> {
+  public async deleteAll(siteId?: string): Promise<void> {
     if (isDemoMode()) {
-      this.memory.clear();
+      if (siteId === undefined) {
+        this.memory.clear();
+      } else {
+        for (const [id, reading] of this.memory) {
+          if (reading.siteId === siteId) {
+            this.memory.delete(id);
+          }
+        }
+      }
       return;
     }
-    await this.prisma.weighReading.deleteMany({});
+    await this.prisma.weighReading.deleteMany({ where: siteId === undefined ? {} : { siteId } });
   }
 }

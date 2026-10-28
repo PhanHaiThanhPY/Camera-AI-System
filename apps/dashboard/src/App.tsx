@@ -1,4 +1,6 @@
 import { ReactElement, useEffect, useState } from "react";
+import { useAuth } from "./AuthContext";
+import AccountsPage from "./AccountsPage";
 import ConfirmPage from "./ConfirmPage";
 import CapturesTable from "./CapturesTable";
 import LivePage from "./LivePage";
@@ -6,22 +8,48 @@ import OpsPage from "./OpsPage";
 import PassPage from "./PassPage";
 import { useGateCatalog, useGateFeed } from "./PassDetail";
 
-type View = "live" | "confirm" | "table" | "ops";
-const VIEWS: View[] = ["live", "confirm", "table", "ops"];
-/** Bốn mục chuẩn theo sơ đồ sidebar trong proposal (trang 08–11). Bot Telegram chỉ cấu hình qua biến môi
- *  trường (TELEGRAM_BOT_TOKEN/DEEPSEEK_API_KEY) trên máy chủ API, không có trang cài đặt riêng ở dashboard. */
-const NAV_ITEMS: { view: View; num: string; label: string }[] = [
+type View = "live" | "confirm" | "table" | "ops" | "accounts";
+const VIEWS: View[] = ["live", "confirm", "table", "ops", "accounts"];
+/** Sidebar: bốn mục chuẩn theo sơ đồ trong proposal (trang 08–11) + "Quản lý tài khoản" (chỉ ADMIN,
+ *  lọc ở renderNavItems). "Điều hành" gộp luôn tạo/sửa cơ sở + báo cáo + danh mục xe & tài xế (xem
+ *  OpsPage.tsx) — không còn mục "Tài xế"/"Cơ sở" riêng ở sidebar. Bot Telegram chỉ cấu hình qua biến
+ *  môi trường (TELEGRAM_BOT_TOKEN/DEEPSEEK_API_KEY) trên máy chủ API. */
+const NAV_ITEMS: { view: View; num: string; label: string; adminOnly?: true }[] = [
   { view: "live", num: "01", label: "Trạm cân trực tiếp" },
   { view: "confirm", num: "02", label: "Xác nhận vật liệu" },
   { view: "table", num: "03", label: "Sổ cân & truy vết" },
-  { view: "ops", num: "04", label: "Điều hành ba cơ sở" }
+  { view: "ops", num: "04", label: "Điều hành" },
+  { view: "accounts", num: "05", label: "Quản lý tài khoản", adminOnly: true }
 ];
 const VIEW_TITLES: Record<View, { title: string; subtitle: string }> = {
-  live: { title: "Trạm cân trực tiếp", subtitle: "" },
-  confirm: { title: "Nhận đúng nhóm hàng, kiểm soát riêng từng cấp đá", subtitle: "" },
-  table: { title: "Sổ cân & truy vết", subtitle: "" },
-  ops: { title: "Điều hành ba cơ sở", subtitle: "" }
+  live: { title: "Trạm cân trực tiếp", subtitle: "Theo dõi phiên cân đang diễn ra và ảnh chụp bằng chứng theo thời gian thực." },
+  confirm: { title: "Nhận đúng nhóm hàng, kiểm soát riêng từng cấp đá", subtitle: "Tra nhãn vật liệu để phân loại đúng cấp đá/cát trước khi xác nhận." },
+  table: { title: "Sổ cân & truy vết", subtitle: "Tìm, lọc và sửa lại các lượt cân đã ghi nhận." },
+  ops: { title: "Điều hành", subtitle: "Tạo/sửa cơ sở, xem báo cáo sản lượng và danh mục xe & tài xế." },
+  accounts: { title: "Quản lý tài khoản", subtitle: "Tạo và quản lý tài khoản đăng nhập cho nhân viên." }
 };
+
+/** Dropdown chọn cơ sở đang xem/vận hành ở topbar — 1 cơ sở (USER thường) thì chỉ hiện tên tĩnh,
+ *  nhiều cơ sở thì cho chọn; ADMIN có thêm "Tất cả cơ sở" để xem gộp mọi đối tác. */
+function SiteSwitcher(): ReactElement | null {
+  const { user, sites, currentSiteId, setCurrentSiteId } = useAuth();
+  if (sites.length === 0) {
+    return null;
+  }
+  if (user?.role !== "ADMIN" && sites.length === 1) {
+    return <span className="site-switcher-label">{sites[0].name}</span>;
+  }
+  return (
+    <select aria-label="Chọn cơ sở" className="site-switcher" value={currentSiteId ?? ""} onChange={(event) => setCurrentSiteId(event.target.value === "" ? null : event.target.value)}>
+      {user?.role === "ADMIN" && <option value="">Tất cả cơ sở</option>}
+      {sites.map((site) => (
+        <option key={site.id} value={site.id}>
+          {site.name}{site.ownerName !== undefined ? ` — ${site.ownerName}` : ""}
+        </option>
+      ))}
+    </select>
+  );
+}
 /** Route theo hash (#/live, #/table, #/pass/<id>) nên chạy được trên mọi static host. */
 function readRoute(): { view: View; passId: string | null } {
   const parts = window.location.hash.replace(/^#\/?/, "").split("/").filter((part) => part !== "");
@@ -50,6 +78,8 @@ function readSidebarOpen(): boolean {
 }
 
 function App(): ReactElement {
+  const { user, logout, currentSiteId } = useAuth();
+  const isAdmin = user?.role === "ADMIN";
   const [{ view, passId }, setRoute] = useState(readRoute);
   const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen);
   useEffect(() => {
@@ -57,6 +87,12 @@ function App(): ReactElement {
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+  // Chặn truy cập trực tiếp "Quản lý tài khoản" qua URL nếu không phải admin.
+  useEffect(() => {
+    if (view === "accounts" && !isAdmin) {
+      window.location.hash = "/live";
+    }
+  }, [view, isAdmin]);
   const toggleSidebar = (): void => {
     const next = !sidebarOpen;
     setSidebarOpen(next);
@@ -68,7 +104,7 @@ function App(): ReactElement {
   };
   const titles = passId !== null ? { title: "Chi tiết lượt xe", subtitle: "" } : VIEW_TITLES[view];
   const catalog = useGateCatalog();
-  const { rows, connected, message } = useGateFeed();
+  const { rows, connected, message } = useGateFeed(currentSiteId);
   const offline = !connected;
 
   return (
@@ -82,13 +118,19 @@ function App(): ReactElement {
             <p className="brand-mark">VP HOLDING</p>
             <p className="brand-sub">ĐIỀU HÀNH CÂN XE</p>
             <nav className="brand-nav" aria-label="Menu">
-              {NAV_ITEMS.map((item) => (
+              {NAV_ITEMS.filter((item) => item.adminOnly !== true || isAdmin).map((item) => (
                 <button aria-pressed={view === item.view} key={item.view} type="button" onClick={() => { window.location.hash = `/${item.view}`; }}>
                   <span className="brand-nav-num">{item.num}</span>{item.label}
                 </button>
               ))}
             </nav>
             <p className="brand-footer"><strong>MỎ ĐÁ · MỎ CÁT · BÊ TÔNG</strong>Mỗi chuyến xe, một hồ sơ.</p>
+            {user !== null && (
+              <div className="sidebar-account">
+                <p className="sidebar-account-name">{user.name}</p>
+                <button className="logout-button" type="button" onClick={() => void logout()}>Đăng xuất</button>
+              </div>
+            )}
           </>
         )}
       </aside>
@@ -99,7 +141,10 @@ function App(): ReactElement {
             <h1>{titles.title}</h1>
             {titles.subtitle && <p className="subtitle">{titles.subtitle}</p>}
           </div>
-          <span className={`status-pill ${connected ? "gate-verified" : "gate-mismatch"}`}>{connected ? "● Đã kết nối" : "● Mất kết nối trạm"}</span>
+          <div className="topbar-right">
+            <SiteSwitcher />
+            <span className={`status-pill ${connected ? "gate-verified" : "gate-mismatch"}`}>{connected ? "● Đã kết nối" : "● Mất kết nối trạm"}</span>
+          </div>
         </header>
         {passId !== null ? (
           <PassPage catalog={catalog} pass={rows.find((row) => row.id === passId) ?? null} onBack={() => { window.location.hash = "/table"; }} />
@@ -109,6 +154,7 @@ function App(): ReactElement {
             {view === "confirm" && <ConfirmPage />}
             {view === "table" && <CapturesTable onOpenPass={(id) => { window.location.hash = `/pass/${id}`; }} />}
             {view === "ops" && <OpsPage />}
+            {view === "accounts" && isAdmin && <AccountsPage />}
           </>
         )}
       </div>

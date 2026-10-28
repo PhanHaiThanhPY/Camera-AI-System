@@ -1,5 +1,6 @@
 // Phải là import đầu tiên: nạp .env trước khi bất kỳ module nào khác đọc process.env ở top-level.
 import "dotenv/config";
+import cookieParser from "cookie-parser";
 import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
 
@@ -10,7 +11,9 @@ async function bootstrap(): Promise<void> {
     .map((origin) => origin.trim())
     .filter((origin) => origin !== "");
 
-  app.enableCors({ origin: corsOrigins });
+  app.use(cookieParser());
+  // credentials: true — bắt buộc để trình duyệt gửi/nhận cookie đăng nhập (cas_session) qua CORS.
+  app.enableCors({ origin: corsOrigins, credentials: true });
   app.setGlobalPrefix("api");
 
   const port = Number(process.env.PORT ?? 4000);

@@ -2,7 +2,6 @@ import { BadGatewayException, BadRequestException, Injectable, Logger } from "@n
 import type { OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { GatePassRepository } from "./gate-pass.repository";
-// NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { AssistantService } from "./assistant.service";
 import { buildReport, toPlainText } from "./telegram.report";
@@ -20,7 +19,7 @@ export interface PublicConfig {
   chatId: string | null;
   chatTitle: string | null;
   timeZone: string;
-  /** true khi DEEPSEEK_API_KEY đã đặt trên máy chủ — trợ lý AI trong Telegram sẵn sàng trả lời câu hỏi tự do. */
+  /** true khi đã đặt DEEPSEEK_API_KEY — bot chấp nhận câu hỏi tự do, không chỉ /start. */
   assistantEnabled: boolean;
 }
 
@@ -56,19 +55,17 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /**
  * Tích hợp bot Telegram: token + nhóm nhận báo cáo đọc thẳng từ biến môi trường (TELEGRAM_BOT_TOKEN/
  * TELEGRAM_CHAT_ID) — không nhập/lưu qua giao diện hay Postgres nữa (bảo mật: credential không đi qua
- * trình duyệt hay nằm trong DB). Gửi báo cáo ngày, và chạy vòng long-poll nền để nhận tin nhắn — admin
- * chat trực tiếp với bot, câu hỏi tự do được chuyển cho AssistantService (DeepSeek) trả lời dựa trên dữ
- * liệu thật của hệ thống.
+ * trình duyệt hay nằm trong DB). Gửi báo cáo ngày theo yêu cầu/nút bấm, VÀ (nếu đã cấu hình
+ * DEEPSEEK_API_KEY) chuyển tin nhắn tự do từ các chat được phép cho AssistantService trả lời dựa trên
+ * dữ liệu thật — xem AssistantService để biết lý do bắt buộc phải qua một lớp server làm cầu nối. Vòng
+ * long-poll nền vừa để ghi nhận nhóm/chat bot đã thấy (phục vụ "Tìm nhóm" ở dashboard), vừa để nhận tin
+ * nhắn admin gửi cho bot.
  */
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramService.name);
   private readonly apiBase = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
   private readonly timeZone = process.env.REPORT_TIMEZONE ?? "Asia/Ho_Chi_Minh";
-  private readonly allowedChatIds = (process.env.TELEGRAM_ASSISTANT_ALLOWED_CHAT_IDS ?? "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter((id) => id !== "");
   /** Nhóm/chat bot đã nhìn thấy qua vòng long-poll — thay cho việc gọi getUpdates riêng mỗi lần bấm "Tìm nhóm". */
   private readonly seenChats = new Map<string, TelegramChat>();
   /** @username của bot, lấy 1 lần qua getMe rồi nhớ trong tiến trình — chỉ hiển thị, không phải credential. */
@@ -103,7 +100,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       chatId: config.chatId === "" ? null : config.chatId,
       chatTitle: config.chatId === "" ? null : (this.seenChats.get(config.chatId)?.title ?? null),
       timeZone: this.timeZone,
-      assistantEnabled: this.assistant.configured
+      assistantEnabled: this.assistant.enabled
     };
   }
 
@@ -152,32 +149,47 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Tin nhắn admin gửi trực tiếp cho bot: /start, /reset, hoặc câu hỏi tự do chuyển cho trợ lý AI. */
+  /** Tin nhắn admin gửi trực tiếp cho bot. /start và /reset luôn trả lời; tin nhắn tự do khác chỉ chuyển
+   *  cho AssistantService (DeepSeek) nếu đã cấu hình DEEPSEEK_API_KEY VÀ chat này nằm trong danh sách
+   *  được phép (isAllowedChat) — tránh người lạ thêm bot vào nhóm khác rồi tốn tiền API key của mình.
+   *  Vẫn xử lý update (seenChats) trước đó ở pollOnce ngay cả khi không trả lời gì, để "Tìm nhóm" hoạt động. */
   private async handleIncomingMessage(token: string, chatId: string, text: string): Promise<void> {
-    if (this.allowedChatIds.length > 0 && !this.allowedChatIds.includes(chatId)) {
-      return;
-    }
     const trimmed = text.trim();
     if (trimmed === "/start") {
       await this.call(token, "sendMessage", {
         chat_id: chatId,
-        text: "Xin chào, tôi là trợ lý AI của hệ thống kiểm soát xe & vật liệu.\nHỏi tôi bất cứ điều gì về dữ liệu hệ thống, ví dụ: \"hôm nay có bao nhiêu xe vào ra\", \"tổng khối lượng hàng tuần này\", \"xe 51C-12345 của ai lái\".\nGửi /reset để bắt đầu lại cuộc trò chuyện."
+        text: this.assistant.enabled
+          ? "Xin chào, bạn có thể hỏi về số liệu xe ra/vào, khối lượng cân theo ngày, hoặc danh sách xe/tài xế. Gõ /reset để xoá lịch sử hội thoại."
+          : "Xin chào, bot này chỉ gửi báo cáo xe ra/vào theo yêu cầu từ dashboard — chưa cấu hình trợ lý trả lời câu hỏi tự do (DEEPSEEK_API_KEY)."
       });
       return;
     }
     if (trimmed === "/reset") {
-      this.assistant.resetHistory(chatId);
-      await this.call(token, "sendMessage", { chat_id: chatId, text: "Đã xoá ngữ cảnh hội thoại cũ." });
+      this.assistant.reset(chatId);
+      await this.call(token, "sendMessage", { chat_id: chatId, text: "Đã xoá lịch sử hội thoại với trợ lý." });
       return;
     }
-    if (trimmed === "") {
+    if (!this.assistant.enabled || !this.isAllowedChat(chatId)) {
       return;
     }
-    await this.call(token, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => undefined);
-    const reply = await this.assistant.reply(chatId, trimmed);
-    await this.call(token, "sendMessage", { chat_id: chatId, text: reply }).catch((error: unknown) => {
-      this.logger.warn(`failed to send assistant reply: ${error instanceof Error ? error.message : "unknown"}`);
-    });
+    try {
+      const answer = await this.assistant.ask(chatId, trimmed);
+      await this.call(token, "sendMessage", { chat_id: chatId, text: answer });
+    } catch (error) {
+      this.logger.warn(`assistant failed chatId=${chatId}: ${error instanceof Error ? error.message : "unknown"}`);
+      await this.call(token, "sendMessage", { chat_id: chatId, text: "Có lỗi khi hỏi trợ lý, thử lại sau." });
+    }
+  }
+
+  /** Mặc định (chưa đặt TELEGRAM_ASSISTANT_ALLOWED_CHAT_IDS) chỉ cho đúng nhóm nhận báo cáo
+   *  (TELEGRAM_CHAT_ID) hỏi trợ lý — không đặt gì cả thì không chat nào được hỏi (an toàn, tránh lạm dụng). */
+  private isAllowedChat(chatId: string): boolean {
+    const raw = process.env.TELEGRAM_ASSISTANT_ALLOWED_CHAT_IDS ?? process.env.TELEGRAM_CHAT_ID ?? "";
+    const allowed = raw
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => id !== "");
+    return allowed.includes(chatId);
   }
 
   public async sendTest(): Promise<void> {

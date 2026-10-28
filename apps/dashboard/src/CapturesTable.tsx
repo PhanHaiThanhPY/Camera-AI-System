@@ -1,7 +1,13 @@
-import { MouseEvent, ReactElement, useState } from "react";
+import { ChangeEvent, MouseEvent, ReactElement, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Lightbox, STATUS_LABELS, VISIT_LABELS, formatKg, formatTime, request, useGateCatalog, useLightbox, weighLegs } from "./PassDetail";
+import { useAuth } from "./AuthContext";
+import { API_BASE_URL, Lightbox, STATUS_LABELS, VISIT_LABELS, formatKg, formatTime, request, siteQuery, useGateCatalog, useLightbox, weighLegs } from "./PassDetail";
 import type { Catalog, GatePass } from "./PassDetail";
+
+interface ImportResult {
+  imported: number;
+  errors: { row: number; message: string }[];
+}
 
 const labelOf = (items: Catalog["vehicleTypes"] | undefined, code: string | null): string =>
   code === null ? "—" : (items?.find((item) => item.code === code)?.label ?? code);
@@ -103,12 +109,18 @@ function exportCsv(rows: GatePass[], catalog: Catalog | undefined): void {
  *  hơn hẳn popup cũ. Trạm cân trực tiếp (LivePage) chỉ xem, không sửa được ở đó nữa. */
 export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string) => void }): ReactElement {
   const catalog = useGateCatalog();
-  const passesQuery = useQuery({ queryKey: ["gate-passes-table"], queryFn: () => request<GatePass[]>("/passes"), refetchInterval: 3000 });
+  const { currentSiteId } = useAuth();
+  const passesQuery = useQuery({
+    queryKey: ["gate-passes-table", currentSiteId],
+    queryFn: () => request<GatePass[]>(`/passes${siteQuery(currentSiteId)}`),
+    refetchInterval: 3000
+  });
   const queryClient = useQueryClient();
   const lightbox = useLightbox();
   const [clearMessage, setClearMessage] = useState<string | null>(null);
   const clear = useMutation({
-    mutationFn: (scope: "resolved" | "all") => request<ClearResult>(`/passes?scope=${scope}`, { method: "DELETE" }),
+    mutationFn: (scope: "resolved" | "all") =>
+      request<ClearResult>(`/passes?scope=${scope}${currentSiteId !== null ? `&siteId=${encodeURIComponent(currentSiteId)}` : ""}`, { method: "DELETE" }),
     onSuccess: (result) => {
       setClearMessage(`Đã xoá ${result.removed} lượt.`);
       void queryClient.invalidateQueries({ queryKey: ["gate-passes-table"] });
@@ -118,6 +130,36 @@ export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string)
   const confirmClear = (scope: "resolved" | "all", question: string): void => {
     if (window.confirm(question)) {
       clear.mutate(scope);
+    }
+  };
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importMessage, setImportMessage] = useState<string | null>(null);
+  const importExcel = useMutation({
+    mutationFn: async (file: File): Promise<ImportResult> => {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch(`${API_BASE_URL}/gate/passes/import${siteQuery(currentSiteId)}`, { method: "POST", credentials: "include", body: form });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+        throw new Error(payload?.message ?? "Nhập Excel thất bại.");
+      }
+      return response.json() as Promise<ImportResult>;
+    },
+    onSuccess: (result) => {
+      const preview = result.errors.slice(0, 5).map((item) => `dòng ${item.row}: ${item.message}`).join("; ");
+      const suffix = result.errors.length === 0 ? "" : ` — ${result.errors.length} dòng lỗi (${preview}${result.errors.length > 5 ? "…" : ""})`;
+      setImportMessage(`Đã nhập ${result.imported} lượt từ Excel.${suffix}`);
+      void queryClient.invalidateQueries({ queryKey: ["gate-passes-table"] });
+    },
+    onError: (error: unknown) => setImportMessage(error instanceof Error ? error.message : "Có lỗi xảy ra.")
+  });
+  const onFileSelected = (event: ChangeEvent<HTMLInputElement>): void => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (file !== undefined) {
+      setImportMessage(null);
+      importExcel.mutate(file);
     }
   };
   const [fromDate, setFromDate] = useState("");
@@ -134,9 +176,6 @@ export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string)
 
   return (
     <section className="panel captures-page captures-full">
-      <div className="panel-heading">
-        <div><h2>Sổ cân theo chuyến xe</h2><p className="muted-text captures-description">Dữ liệu minh họa. Phiếu mới được thêm sau khi chốt mô phỏng.</p></div>
-      </div>
       <div className="sheet-filter captures-extra">
         <label>Từ ngày<input max={toDate || undefined} type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} /></label>
         <label>Đến ngày<input min={fromDate || undefined} type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} /></label>
@@ -154,6 +193,20 @@ export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string)
         </button>
       </div>
       {clearMessage !== null && <p className="muted-text">{clearMessage}</p>}
+      <div className="captures-toolbar captures-extra">
+        <a className="secondary-button captures-link-button" href={`${API_BASE_URL}/gate/import-template`} rel="noopener">Tải file mẫu Excel</a>
+        <button
+          className="secondary-button"
+          disabled={importExcel.isPending || currentSiteId === null}
+          title={currentSiteId === null ? "Chọn 1 cơ sở cụ thể trước (không nhập được ở \"Tất cả cơ sở\")." : "Nhập các lượt đã ghi tay lúc mất điện (cân xong cả hai đầu) từ file Excel."}
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+        >
+          {importExcel.isPending ? "Đang nhập…" : "Nhập Excel (backup mất điện)"}
+        </button>
+        <input accept=".xlsx" hidden ref={fileInputRef} type="file" onChange={onFileSelected} />
+      </div>
+      {importMessage !== null && <p className="muted-text">{importMessage}</p>}
       {rows.length === 0 ? (
         <div className="empty-state">
           <span className="empty-icon">◌</span>
@@ -167,7 +220,7 @@ export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string)
               <tr>
                 <th>#</th>
                 <th>Thời gian chụp</th>
-                <th>Biển số</th>
+                <th className="cell-center">Biển số</th>
                 <th>Ra / Vào</th>
                 <th>Tài xế</th>
                 <th>Loại xe</th>
@@ -187,7 +240,7 @@ export default function CapturesTable({ onOpenPass }: { onOpenPass: (id: string)
                   <tr className="clickable" key={row.id} onClick={() => onOpenPass(row.id)}>
                     <td className="cell-num">{rows.length - index}</td>
                     <td className="cell-nowrap">{formatTime(row.capture.capturedAt)}</td>
-                    <td className="cell-plate">{row.effective.plateNumber}</td>
+                    <td className="cell-center"><span className="cell-plate">{row.effective.plateNumber}</span></td>
                     <td className="cell-nowrap"><span className={`status-pill visit-${row.visitStatus.toLowerCase()}`}>{VISIT_LABELS[row.visitStatus]}</span></td>
                     <td className="cell-nowrap">{driverText(row)}</td>
                     <td>{labelOf(catalog?.vehicleTypes, row.effective.vehicleType)}</td>

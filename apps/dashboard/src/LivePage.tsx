@@ -1,17 +1,19 @@
 import { ReactElement, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { CaptureGallery, PassDetail, PhienCanPanel, formatTime, postJson } from "./PassDetail";
+import { useAuth } from "./AuthContext";
+import { CaptureGallery, PassDetail, PhienCanPanel, formatTime, postJson, siteQuery } from "./PassDetail";
 import type { Catalog, GatePass } from "./PassDetail";
 
 const VISIBLE_ROWS = 30;
 
 /** Trạm cân trực tiếp: lượt xe mới nhất tại trạm, cập nhật realtime qua SSE khi worker xác nhận biển số/cân. */
 export default function LivePage({ rows, catalog, message, offline }: { rows: GatePass[]; catalog: Catalog | undefined; message: string | null; offline: boolean }): ReactElement {
+  const { currentSiteId } = useAuth();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected = rows.find((row) => row.id === selectedId) ?? rows[0] ?? null;
 
   const simulate = useMutation({
-    mutationFn: () => postJson<GatePass>("/simulate/weigh-and-capture", {}),
+    mutationFn: () => postJson<GatePass>(`/simulate/weigh-and-capture${siteQuery(currentSiteId)}`, {}),
     onSuccess: (pass) => setSelectedId(pass.id),
     onError: () => undefined
   });
@@ -26,7 +28,13 @@ export default function LivePage({ rows, catalog, message, offline }: { rows: Ga
             ))}
           </select>
         )}
-        <button className="secondary-button" disabled={simulate.isPending} title="Mô phỏng 1 xe đi qua trạm cân + camera chụp — không cần cân/camera thật." type="button" onClick={() => simulate.mutate()}>
+        <button
+          className="secondary-button"
+          disabled={simulate.isPending || currentSiteId === null}
+          title={currentSiteId === null ? "Chọn 1 cơ sở cụ thể trước (không mô phỏng được ở \"Tất cả cơ sở\")." : "Mô phỏng 1 xe đi qua trạm cân + camera chụp — không cần cân/camera thật."}
+          type="button"
+          onClick={() => simulate.mutate()}
+        >
           {simulate.isPending ? "Đang mô phỏng…" : "Mô phỏng cân + chụp"}
         </button>
         {simulate.isError && <span className="error-message">{simulate.error instanceof Error ? simulate.error.message : "Có lỗi xảy ra."}</span>}

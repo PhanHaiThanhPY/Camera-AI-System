@@ -11,8 +11,9 @@ export interface Classification {
 
 /** Một lần nhận diện biển số — số liệu để chạy nghiệp vụ, kèm ảnh bằng chứng (MinIO) nếu có. */
 export interface PlateCapture {
-  /** "weighbridge" = lượt tạo thẳng từ số liệu cân, không qua nhận diện biển số. */
-  source: "video" | "weighbridge";
+  /** "weighbridge" = lượt tạo thẳng từ số liệu cân, không qua nhận diện biển số. "manual" = nhập tay
+   *  từ file Excel (backup lúc mất điện) — xem GatePassesService.importManualPasses. */
+  source: "video" | "weighbridge" | "manual";
   cameraId: string;
   clockSource: "server" | "camera";
   capturedAt: string;
@@ -28,6 +29,7 @@ export interface PlateCapture {
 /** Một lần cân từ trạm cân ngoài. grossKg = xe + hàng, tareKg = xe không; mỗi lần cân thường chỉ có một trong hai. */
 export interface WeighReading {
   id: string;
+  siteId: string;
   scaleId: string;
   ticketNo: string | null;
   plateNumber: string | null;
@@ -51,7 +53,7 @@ export interface WeighSummary {
   tareAt: string | null;
   firstMeasuredAt: string;
   readingIds: string[];
-  source: "external" | "mock";
+  source: "external" | "mock" | "manual";
 }
 
 export type CheckResult = "pass" | "warn" | "fail" | "skipped";
@@ -125,6 +127,7 @@ export interface GatePass {
   /** Đối chiếu với danh sách xe trong bãi (master data) và tài xế của xe đó. */
   master: MasterLink;
   id: string;
+  siteId: string;
   createdAt: string;
   updatedAt: string;
   /** null = luồng bình thường. "pending" = đã có số liệu cân, đang chờ đủ ảnh từ camera (xem GatePassesService).

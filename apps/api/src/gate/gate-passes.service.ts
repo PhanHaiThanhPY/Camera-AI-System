@@ -10,8 +10,12 @@ import { WeighReadingRepository } from "./weigh-reading.repository";
 // NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { MasterDataService } from "./master-data.service";
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { SitesService } from "../sites/sites.service";
+import type { SiteScope } from "../sites/site.types";
 import { NO_MASTER_LINK } from "./master.types";
 import { randomDemoPlate, randomDemoShots, randomNetKg, randomTareKg } from "./gate.mock";
+import type { ImportRowError, ManualImportRow } from "./gate-excel.service";
 import type { AuditEntry, CaptureAttempt, CaptureShot, Classification, DetectionInput, GateOverrides, GatePass, PlateCapture, WeighReading, WeighSummary } from "./gate.types";
 import {
   computeVisitStatus,
@@ -41,7 +45,11 @@ export interface ResolveInput {
 
 export type ClearScope = "resolved" | "all";
 
-export type GateEvent = { type: "upsert"; pass: GatePass } | { type: "remove"; id: string };
+function scopeSiteId(scope: SiteScope): string | undefined {
+  return "siteId" in scope ? scope.siteId : undefined;
+}
+
+export type GateEvent = { type: "upsert"; pass: GatePass } | { type: "remove"; id: string; siteId: string };
 
 /** Tham số cho mô phỏng (nút "Mô phỏng cân + chụp" ở dashboard và DemoSeedService) — đi qua đúng luồng thật
  *  (resolvePassForWeighSignal + openCaptureWindow + submitCaptureResult), không phải code riêng. */
@@ -88,49 +96,55 @@ export class GatePassesService {
   public constructor(
     private readonly master: MasterDataService,
     private readonly passes: GatePassRepository,
-    private readonly readings: WeighReadingRepository
+    private readonly readings: WeighReadingRepository,
+    private readonly sites: SitesService
   ) {
     // Đối chiếu lại các lượt đang chờ xử lý mỗi khi master data đổi (tài xế/xe trong bãi thêm/sửa/xoá).
+    // Quét toàn bộ site (không lọc) — mỗi pass tự resolve đúng account của mình trong recomputeFields().
     master.changes.subscribe(() => void this.refreshAllPending());
   }
 
-  public listPasses(): Promise<GatePass[]> {
-    return this.passes.list();
+  public listPasses(scope: SiteScope): Promise<GatePass[]> {
+    return this.passes.list({ siteId: scopeSiteId(scope) });
   }
 
-  public async getPass(id: string): Promise<GatePass> {
+  public async getPass(id: string, scope: SiteScope): Promise<GatePass> {
     const pass = await this.passes.findById(id);
-    if (pass === null) {
+    if (pass === null || !this.matchesScope(pass, scope)) {
       throw new NotFoundException("Không tìm thấy lượt xe.");
     }
     return pass;
   }
 
-  /** Xoá bản ghi của lượt xe. */
-  public async clear(scope: ClearScope | string): Promise<{ removed: number }> {
+  private matchesScope(pass: GatePass, scope: SiteScope): boolean {
+    return "allSites" in scope || pass.siteId === scope.siteId;
+  }
+
+  /** Xoá bản ghi của lượt xe, trong phạm vi site đang chọn. */
+  public async clear(scope: ClearScope | string, siteScope: SiteScope): Promise<{ removed: number }> {
     const resolutions: GatePass["resolution"][] = scope === "all" ? ["PENDING", "CONFIRMED", "REJECTED"] : ["CONFIRMED", "REJECTED"];
-    const targets = await this.passes.list();
+    const targets = await this.passes.list({ siteId: scopeSiteId(siteScope) });
     const matching = targets.filter((pass) => resolutions.includes(pass.resolution));
     for (const pass of matching) {
       this.forgetTrack(pass.id);
       this.forgetCapture(pass.id);
-      this.events.next({ type: "remove", id: pass.id });
+      this.events.next({ type: "remove", id: pass.id, siteId: pass.siteId });
     }
     await this.passes.deleteMany(matching.map((pass) => pass.id));
     if (scope === "all") {
-      await this.readings.deleteAll();
+      await this.readings.deleteAll(scopeSiteId(siteScope));
     }
     this.logger.log(`gate-clear scope=${scope} removed=${matching.length}`);
     return { removed: matching.length };
   }
 
-  public async remove(id: string): Promise<{ removed: number }> {
-    const pass = await this.getPass(id);
+  public async remove(id: string, scope: SiteScope): Promise<{ removed: number }> {
+    const pass = await this.getPass(id, scope);
     await this.readings.deleteByIds(pass.weighing?.readingIds ?? []);
     await this.passes.delete(id);
     this.forgetTrack(id);
     this.forgetCapture(id);
-    this.events.next({ type: "remove", id });
+    this.events.next({ type: "remove", id, siteId: pass.siteId });
     return { removed: 1 };
   }
 
@@ -151,8 +165,8 @@ export class GatePassesService {
     }
   }
 
-  public listReadings(): Promise<WeighReading[]> {
-    return this.readings.list();
+  public listReadings(scope: SiteScope): Promise<WeighReading[]> {
+    return this.readings.list(200, scopeSiteId(scope));
   }
 
   /**
@@ -163,25 +177,30 @@ export class GatePassesService {
    * Các lần sau cùng track (python chốt biển số tốt hơn) chỉ cập nhật đúng phía vào/ra của record đó.
    */
   public async ingestDetection(detection: DetectionInput): Promise<GatePass> {
+    const resolved = this.sites.resolveByCameraId(detection.cameraId);
+    if (resolved === undefined) {
+      throw new NotFoundException(`cameraId "${detection.cameraId}" chưa đăng ký cho cơ sở nào — thêm camera này ở trang Cơ sở trước.`);
+    }
+    const siteId = resolved.site.id;
     const trackKey = `${detection.cameraId}:${detection.trackId ?? detection.plateNumber}`;
     const existingId = this.passByTrack.get(trackKey);
     const existing = existingId === undefined ? null : await this.passes.findById(existingId);
 
     if (existing === null) {
-      const openPass = await this.findOpenPassByPlate(normalizePlate(detection.plateNumber));
+      const openPass = await this.findOpenPassByPlate(normalizePlate(detection.plateNumber), siteId);
       if (openPass !== undefined) {
         this.passByTrack.set(trackKey, openPass.id);
         this.exitTracks.add(trackKey);
         openPass.exitCapture = this.captureFromDetection(detection, new Date().toISOString());
         this.pushAudit(openPass, "system", "exit_sighting", null, null, { trackKey, plate: detection.plateNumber });
         await this.refresh(openPass);
-        await this.mockExitWeigh(openPass);
+        await this.mockExitWeigh(openPass, siteId);
         return openPass;
       }
       const capture = this.captureFromDetection(detection, new Date().toISOString());
-      const pass = await this.registerPass(capture, detection.vehicleType ?? UNAVAILABLE, detection.material ?? UNAVAILABLE);
+      const pass = await this.registerPass(capture, detection.vehicleType ?? UNAVAILABLE, detection.material ?? UNAVAILABLE, siteId);
       this.passByTrack.set(trackKey, pass.id);
-      await this.mockEntryWeigh(pass);
+      await this.mockEntryWeigh(pass, siteId);
       return pass;
     }
     if (existing.resolution !== "PENDING") {
@@ -216,9 +235,9 @@ export class GatePassesService {
    * không có cân (ví dụ video test không bật cân) sẽ "bẫy" mọi video sau này có cùng biển số, coi nhầm là
    * xe ra của lượt cũ thay vì tạo lượt mới cho video đó.
    */
-  private async findOpenPassByPlate(plateNormalized: string): Promise<GatePass | undefined> {
+  private async findOpenPassByPlate(plateNormalized: string, siteId: string): Promise<GatePass | undefined> {
     const nowMs = Date.now();
-    const pending = await this.passes.findPending();
+    const pending = await this.passes.findPending(siteId);
     let best: GatePass | undefined;
     for (const pass of pending) {
       if (pass.visitStatus === "EXITED") {
@@ -244,22 +263,22 @@ export class GatePassesService {
    * matchReadingByPlate(), KHÔNG mở đợt chờ ảnh (openCaptureWindow) như luồng cân-trước-chụp-sau mới, để không
    * đè ảnh continuous-detection đã có bằng một đợt chờ ảnh không bao giờ được trả lời.
    */
-  private async mockEntryWeigh(pass: GatePass): Promise<void> {
+  private async mockEntryWeigh(pass: GatePass, siteId: string): Promise<void> {
     if (process.env.WEIGHBRIDGE_MOCK_RANDOM !== "true") {
       return;
     }
     const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
-    await this.matchReadingByPlate({ ...base, grossKg: null, tareKg: randomTareKg(), measuredAt: new Date().toISOString() }, "mock");
+    await this.matchReadingByPlate({ ...base, grossKg: null, tareKg: randomTareKg(), measuredAt: new Date().toISOString() }, "mock", siteId);
   }
 
   /** Cân giả lập lúc xe ra (đã chở đá lên): gross = tare lúc vào + hàng random, để net luôn hợp lý. */
-  private async mockExitWeigh(pass: GatePass): Promise<void> {
+  private async mockExitWeigh(pass: GatePass, siteId: string): Promise<void> {
     if (process.env.WEIGHBRIDGE_MOCK_RANDOM !== "true") {
       return;
     }
     const tareKg = pass.weighing?.tareKg ?? randomTareKg();
     const base = { scaleId: "SCALE-MOCK", ticketNo: `M${Date.now().toString(36).toUpperCase()}`, plateNumber: pass.capture.plateText };
-    await this.matchReadingByPlate({ ...base, grossKg: tareKg + randomNetKg(), tareKg: null, measuredAt: new Date().toISOString() }, "mock");
+    await this.matchReadingByPlate({ ...base, grossKg: tareKg + randomNetKg(), tareKg: null, measuredAt: new Date().toISOString() }, "mock", siteId);
   }
 
   /**
@@ -269,9 +288,9 @@ export class GatePassesService {
    * nguyên hành vi cũ) — luồng MỚI (ingestReading/simulateWeighAndCapture) dùng resolvePassForWeighSignal
    * (theo trạm cân, không theo biển số — xem đó để biết lý do: cân xong mới chụp nên lúc cân CHƯA có biển số).
    */
-  private async matchReadingByPlate(input: ReadingInput, source: WeighReading["source"]): Promise<WeighReading> {
-    const reading = await this.readings.create({ ...input, source });
-    const pending = await this.passes.findPending();
+  private async matchReadingByPlate(input: ReadingInput, source: WeighReading["source"], siteId: string): Promise<WeighReading> {
+    const reading = await this.readings.create({ ...input, source, siteId });
+    const pending = await this.passes.findPending(siteId);
     let best: { pass: GatePass; score: number } | null = null;
     for (const pass of pending) {
       const score = pass.weighing === null ? matchScore(pass, reading, this.config.matchWindowSeconds) : secondWeighScore(pass, reading, this.config.secondWeighWindowSeconds);
@@ -282,7 +301,7 @@ export class GatePassesService {
     if (best !== null) {
       await this.attachReading(best.pass, reading, "system", null);
     } else if (reading.plateNumber !== null && normalizePlate(reading.plateNumber).length >= 4) {
-      await this.createFromReading(reading);
+      await this.createFromReading(reading, siteId);
     } else {
       this.logger.warn(`weigh-reading unmatched id=${reading.id} ticket=${reading.ticketNo ?? "-"}`);
     }
@@ -297,23 +316,27 @@ export class GatePassesService {
    * rời bàn cân đi nơi khác rồi mới quay lại) thì luôn tạo lượt mới (lượt VÀO), dù có thể trùng xe thật ngoài
    * đời — hạn chế đã biết khi không còn biển số để phân biệt, xem ARCHITECTURE.md.
    */
-  private async resolvePassForWeighSignal(input: ReadingInput, source: WeighReading["source"]): Promise<{ reading: WeighReading; pass: GatePass; isSecondLeg: boolean }> {
-    const reading = await this.readings.create({ ...input, source });
-    const openForScale = await this.findOpenPassForScale(input.scaleId, Date.parse(reading.measuredAt));
+  private async resolvePassForWeighSignal(
+    input: ReadingInput,
+    source: WeighReading["source"],
+    siteId: string
+  ): Promise<{ reading: WeighReading; pass: GatePass; isSecondLeg: boolean }> {
+    const reading = await this.readings.create({ ...input, source, siteId });
+    const openForScale = await this.findOpenPassForScale(input.scaleId, Date.parse(reading.measuredAt), siteId);
     if (openForScale !== undefined) {
       await this.attachReading(openForScale, reading, "system", null);
       return { reading, pass: openForScale, isSecondLeg: true };
     }
     const capture = this.captureFromReading(reading);
-    const pass = await this.registerPass(capture, UNAVAILABLE, UNAVAILABLE, { autoMatchReadings: false });
+    const pass = await this.registerPass(capture, UNAVAILABLE, UNAVAILABLE, siteId, { autoMatchReadings: false });
     await this.attachReading(pass, reading, "system", null);
     return { reading, pass, isSecondLeg: false };
   }
 
   /** Lượt đang "mở" (đã vào, chưa ra) của đúng trạm cân này, cân lần gần nhất trong vòng
    *  GATE_MATCH_WINDOW_SECONDS — xem resolvePassForWeighSignal. */
-  private async findOpenPassForScale(scaleId: string, atMs: number): Promise<GatePass | undefined> {
-    const pending = await this.passes.findPending();
+  private async findOpenPassForScale(scaleId: string, atMs: number, siteId: string): Promise<GatePass | undefined> {
+    const pending = await this.passes.findPending(siteId);
     let best: GatePass | undefined;
     for (const pass of pending) {
       if (pass.visitStatus === "EXITED" || pass.weighing === null || pass.weighing.scaleId !== scaleId) {
@@ -335,7 +358,11 @@ export class GatePassesService {
   /** Điểm vào của hệ thống cân ngoài (và nền của nút "Mô phỏng cân + chụp"): ghép theo trạm cân rồi mở ngay
    *  một đợt chờ ảnh camera — đúng luồng mới "cân xong mới chụp" (xem resolvePassForWeighSignal). */
   public async ingestReading(input: ReadingInput, source: WeighReading["source"] = "external"): Promise<WeighReading> {
-    const { reading, pass, isSecondLeg } = await this.resolvePassForWeighSignal(input, source);
+    const site = this.sites.resolveByScaleId(input.scaleId);
+    if (site === undefined) {
+      throw new NotFoundException(`scaleId "${input.scaleId}" chưa đăng ký cho cơ sở nào — tạo cơ sở ở trang Cơ sở trước, dùng đúng scaleId hiện ra ở đó.`);
+    }
+    const { reading, pass, isSecondLeg } = await this.resolvePassForWeighSignal(input, source, site.id);
     await this.openCaptureWindow(pass.id, isSecondLeg ? "exitCapture" : "capture");
     return reading;
   }
@@ -352,7 +379,14 @@ export class GatePassesService {
    * coi là 2 lần cân vào của cùng một "lượt đang mở" và bị từ chối (đã có lần cân này).
    */
   public async simulateWeighAndCapture(options: SimulateOptions = {}): Promise<GatePass> {
-    const scaleId = options.scaleId ?? "SCALE-01";
+    if (options.scaleId === undefined || options.scaleId === "") {
+      throw new BadRequestException("scaleId là bắt buộc — chọn cơ sở trước khi mô phỏng cân + chụp.");
+    }
+    const scaleId = options.scaleId;
+    const site = this.sites.resolveByScaleId(scaleId);
+    if (site === undefined) {
+      throw new NotFoundException(`scaleId "${scaleId}" chưa đăng ký cho cơ sở nào.`);
+    }
     let grossKg: number | null = null;
     let tareKg: number | null = null;
     let openPass: GatePass | undefined;
@@ -360,7 +394,7 @@ export class GatePassesService {
       grossKg = options.grossKg ?? null;
       tareKg = options.tareKg ?? null;
     } else {
-      openPass = await this.findOpenPassForScale(scaleId, Date.now());
+      openPass = await this.findOpenPassForScale(scaleId, Date.now(), site.id);
       if (openPass !== undefined) {
         grossKg = (openPass.weighing?.tareKg ?? randomTareKg()) + randomNetKg();
       } else {
@@ -376,7 +410,8 @@ export class GatePassesService {
         tareKg,
         measuredAt: new Date().toISOString()
       },
-      "mock"
+      "mock",
+      site.id
     );
     await this.openCaptureWindow(pass.id, isSecondLeg ? "exitCapture" : "capture");
 
@@ -395,7 +430,7 @@ export class GatePassesService {
    *  giây mà chưa đủ ảnh dùng được thì finalizeCapture tự chốt CAPTURE_FAILED). Đè lên đợt cũ nếu còn mở. */
   private async openCaptureWindow(passId: string, target: "capture" | "exitCapture"): Promise<void> {
     this.forgetCapture(passId);
-    const pass = await this.getPass(passId);
+    const pass = await this.getPass(passId, { allSites: true });
     pass.captureState = "pending";
     pass.captureAttempts = [];
     await this.refresh(pass);
@@ -420,7 +455,7 @@ export class GatePassesService {
 
   /** Một camera gửi kết quả cho đợt chờ ảnh đang mở của `passId`. Đủ số camera mong đợi thì chốt ngay. */
   public async submitCaptureResult(passId: string, shot: CaptureShot): Promise<GatePass> {
-    const pass = await this.getPass(passId);
+    const pass = await this.getPass(passId, { allSites: true });
     if (pass.captureState !== "pending") {
       throw new ConflictException("Lượt xe này không có đợt chờ ảnh đang mở.");
     }
@@ -505,8 +540,8 @@ export class GatePassesService {
     return this.refresh(pass);
   }
 
-  public async linkReading(passId: string, readingId: string, actor: string, reason: string | null): Promise<GatePass> {
-    const pass = await this.getPass(passId);
+  public async linkReading(passId: string, readingId: string, actor: string, reason: string | null, scope: SiteScope): Promise<GatePass> {
+    const pass = await this.getPass(passId, scope);
     const reading = await this.readings.findById(readingId);
     if (reading === null) {
       throw new NotFoundException("Không tìm thấy số liệu cân.");
@@ -524,8 +559,8 @@ export class GatePassesService {
     return pass;
   }
 
-  public async resolve(id: string, decision: "CONFIRMED" | "REJECTED", input: ResolveInput): Promise<GatePass> {
-    const pass = await this.getPass(id);
+  public async resolve(id: string, decision: "CONFIRMED" | "REJECTED", input: ResolveInput, scope: SiteScope): Promise<GatePass> {
+    const pass = await this.getPass(id, scope);
     if (pass.resolution !== "PENDING") {
       throw new ConflictException("Lượt xe đã được xử lý.");
     }
@@ -550,6 +585,101 @@ export class GatePassesService {
     const saved = await this.passes.save(pass);
     this.events.next({ type: "upsert", pass: saved });
     return saved;
+  }
+
+  /**
+   * Nhập các lượt xe đã cân XONG CẢ HAI ĐẦU (vào + ra) từ file Excel — dùng để bảo vệ bổ sung lại các
+   * lượt ghi tay trên giấy lúc mất điện, sau khi hệ thống chạy lại. Mỗi dòng tạo thẳng 1 GatePass đã
+   * VERIFIED/CONFIRMED (coi là đáng tin vì người ghi đã xác nhận bằng mắt), không qua camera/kiểm tra
+   * chéo tự động — khác hẳn luồng ingestDetection/ingestReading (camera/cân thật, tin cậy phải tính).
+   * Xe còn cân giữa chừng (mới có 1 đầu) lúc có điện lại thì cân tiếp bằng trạm cân/camera thật như
+   * bình thường — không nằm trong phạm vi import này.
+   */
+  public async importManualPasses(siteId: string, rows: ManualImportRow[], actor: string): Promise<{ imported: number; errors: ImportRowError[] }> {
+    const errors: ImportRowError[] = [];
+    let imported = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+      try {
+        await this.createManualPass(siteId, rows[index], actor);
+        imported += 1;
+      } catch (error) {
+        errors.push({ row: index + 2, message: error instanceof Error ? error.message : "Lỗi không xác định." });
+      }
+    }
+    return { imported, errors };
+  }
+
+  private async createManualPass(siteId: string, row: ManualImportRow, actor: string): Promise<GatePass> {
+    const plateNormalized = normalizePlate(row.plateNumber);
+    if (plateNormalized.length < 4) {
+      throw new BadRequestException("Biển số không hợp lệ.");
+    }
+    const vehicleType: Classification = row.vehicleTypeCode !== null ? { code: row.vehicleTypeCode, confidence: null, source: "operator" } : UNAVAILABLE;
+    const material: Classification = row.materialCode !== null ? { code: row.materialCode, confidence: null, source: "operator" } : UNAVAILABLE;
+    const plateText = row.plateNumber.trim();
+
+    const capture: PlateCapture = {
+      source: "manual",
+      cameraId: "manual-import",
+      clockSource: "server",
+      capturedAt: row.entryAt,
+      trackId: `manual-${randomUUID()}`,
+      plateText,
+      plateNormalized,
+      ocrConfidence: null,
+      detectorConfidence: null,
+      imageUrl: null
+    };
+    const exitCapture: PlateCapture = { ...capture, capturedAt: row.exitAt };
+    const weighing: WeighSummary = {
+      scaleId: "MANUAL-IMPORT",
+      ticketNo: null,
+      plateNumber: plateText,
+      grossKg: row.grossKg,
+      tareKg: row.tareKg,
+      netKg: row.grossKg - row.tareKg,
+      grossAt: row.exitAt,
+      tareAt: row.entryAt,
+      firstMeasuredAt: row.entryAt,
+      readingIds: [],
+      source: "manual"
+    };
+
+    const draft: GatePass = {
+      master: NO_MASTER_LINK,
+      id: randomUUID(),
+      siteId,
+      createdAt: "",
+      updatedAt: "",
+      captureState: null,
+      captureAttempts: [],
+      capture,
+      exitCapture,
+      vehicleType,
+      material,
+      weighing,
+      checks: [
+        {
+          code: "manual_import",
+          label: "Nhập liệu",
+          result: "skipped",
+          detail: "Ghi nhận thủ công từ file Excel (mất điện) — không qua camera/cân tự động."
+        }
+      ],
+      status: "VERIFIED",
+      statusReasons: [],
+      visitStatus: "EXITED",
+      resolution: "CONFIRMED",
+      overrides: {},
+      effective: { plateNumber: plateText, vehicleType: vehicleType.code, material: material.code },
+      audit: []
+    };
+    draft.master = this.master.lookup(this.sites.getSite(siteId).ownerId, plateText);
+    this.pushAudit(draft, actor, "import_excel", row.note, null, { plate: plateText, tareKg: row.tareKg, grossKg: row.grossKg, entryAt: row.entryAt, exitAt: row.exitAt });
+
+    const pass = await this.passes.create(draft);
+    this.events.next({ type: "upsert", pass });
+    return pass;
   }
 
   private validateOverrides(overrides: GateOverrides): void {
@@ -597,9 +727,9 @@ export class GatePassesService {
   }
 
   /** Tạo lượt mới (cân đầu vào) từ một số liệu cân chưa ghép được với lượt nào đang mở. */
-  private async createFromReading(reading: WeighReading): Promise<GatePass> {
+  private async createFromReading(reading: WeighReading, siteId: string): Promise<GatePass> {
     const capture = this.captureFromReading(reading);
-    const pass = await this.registerPass(capture, UNAVAILABLE, UNAVAILABLE, { autoMatchReadings: false });
+    const pass = await this.registerPass(capture, UNAVAILABLE, UNAVAILABLE, siteId, { autoMatchReadings: false });
     await this.attachReading(pass, reading, "system", null);
     this.logger.log(`weigh-reading created new pass id=${pass.id} plate=${capture.plateText || "?"} (không qua nhận diện biển số)`);
     return pass;
@@ -609,11 +739,13 @@ export class GatePassesService {
     capture: GatePass["capture"],
     vehicleType: Classification,
     material: Classification,
+    siteId: string,
     options: { autoMatchReadings?: boolean } = {}
   ): Promise<GatePass> {
     const draft: GatePass = {
       master: NO_MASTER_LINK,
       id: randomUUID(),
+      siteId,
       createdAt: "",
       updatedAt: "",
       captureState: null,
@@ -639,7 +771,7 @@ export class GatePassesService {
 
     if (options.autoMatchReadings !== false) {
       // Phiếu cân có thể đến trước khi camera xử lý xong.
-      const unattached = await this.readings.findUnattached();
+      const unattached = await this.readings.findUnattached(siteId);
       for (const reading of unattached) {
         if (matchScore(pass, reading, this.config.matchWindowSeconds) !== null) {
           await this.attachReading(pass, reading, "system", null);
@@ -712,7 +844,7 @@ export class GatePassesService {
       vehicleType: pass.overrides.vehicleType ?? pass.vehicleType.code,
       material: pass.overrides.material ?? pass.material.code
     };
-    pass.master = this.master.lookup(pass.effective.plateNumber);
+    pass.master = this.master.lookup(this.sites.getSite(pass.siteId).ownerId, pass.effective.plateNumber);
     pass.checks = runChecks(pass, this.config);
     pass.status = deriveStatus(pass.checks, pass.weighing, pass.master, pass.captureState);
     pass.statusReasons = deriveReasons(pass.status, pass.checks);

@@ -1,4 +1,5 @@
 import { Controller, Get } from "@nestjs/common";
+import { Public } from "./auth/public.decorator";
 import { isDemoMode } from "./config/demo-mode";
 // NestJS needs the runtime class token for constructor dependency injection.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -19,6 +20,7 @@ interface HealthResponse {
 export class HealthController {
   public constructor(private readonly prisma: PrismaService) {}
 
+  @Public()
   @Get()
   public async check(): Promise<HealthResponse> {
     const memory = process.memoryUsage();

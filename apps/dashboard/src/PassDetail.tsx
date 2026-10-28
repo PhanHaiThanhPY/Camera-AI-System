@@ -1,5 +1,7 @@
 import { FormEvent, ReactElement, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { notifyUnauthorized } from "./auth";
+import { useAuth } from "./AuthContext";
 
 /** State dùng chung cho lightbox phóng to ảnh — mỗi nơi có ảnh (CaptureGallery, PhienCanPanel, CapturesTable)
  *  tự giữ state riêng qua hook này, chỉ dùng chung component <Lightbox>. */
@@ -62,7 +64,7 @@ export interface MasterLink {
 }
 
 export interface PlateCapture {
-  source: "video" | "weighbridge";
+  source: "video" | "weighbridge" | "manual";
   cameraId: string;
   capturedAt: string;
   plateText: string;
@@ -100,7 +102,7 @@ export interface GatePass {
     netKg: number | null;
     grossAt: string | null;
     tareAt: string | null;
-    source: "external" | "mock";
+    source: "external" | "mock" | "manual";
   } | null;
   checks: { code: string; label: string; result: CheckResult; detail: string }[];
   status: VerificationStatus;
@@ -140,7 +142,11 @@ const SOURCE_LABELS: Record<Classification["source"], string> = {
 };
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}/gate${path}`, init);
+  const response = await fetch(`${API_BASE_URL}/gate${path}`, { ...init, credentials: "include" });
+  if (response.status === 401) {
+    notifyUnauthorized();
+    throw new Error("Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại.");
+  }
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as { message?: string } | null;
     throw new Error(payload?.message ?? "Yêu cầu thất bại.");
@@ -276,14 +282,6 @@ export function CaptureGallery({ pass }: { pass: GatePass }): ReactElement {
   );
 }
 
-/** Khi editable=false (Trạm cân trực tiếp — chỉ xem): thông báo rõ phải vào Sổ cân & truy vết mới sửa/xác nhận được. */
-function ViewOnlyNote({ pass }: { pass: GatePass }): ReactElement {
-  if (pass.resolution !== "PENDING") {
-    return <p className="muted-text">Lượt xe đã {RESOLUTION_LABELS[pass.resolution].toLowerCase()}.</p>;
-  }
-  return <p className="muted-text">Chỉ xem tại đây — vào <strong>Sổ cân &amp; truy vết</strong> để xác nhận, từ chối hoặc sửa biển số/loại xe/loại đá.</p>;
-}
-
 /** Thẻ "Phiên cân": số liệu tổng/bì/hàng, thông tin phiếu và thao tác xác nhận — khớp bố cục trong proposal.
  *  editable=false (Trạm cân trực tiếp): ẩn hẳn nút/ô sửa, chỉ còn xem — sửa chuyển sang Sổ cân & truy vết. */
 export function PhienCanPanel({ pass, catalog, offline, editable = true }: { pass: GatePass; catalog: Catalog | undefined; offline?: boolean; editable?: boolean }): ReactElement {
@@ -332,12 +330,20 @@ export function PhienCanPanel({ pass, catalog, offline, editable = true }: { pas
         </ul>
       )}
       {offline === true && <p className="offline-note">Tiếp tục lưu tại trạm. Phiếu được đồng bộ khi kết nối trở lại.</p>}
-      {editable ? <ResolvePanel key={pass.id} catalog={catalog} pass={pass} /> : <ViewOnlyNote pass={pass} />}
+      {editable && <ResolvePanel key={pass.id} catalog={catalog} pass={pass} />}
       {w !== null && (
         <div className="ticket-summary">
           <strong>PHIẾU {ticketCode} · {formatKg(w.netKg)}</strong>
           <p>{labelOf(catalog?.materials, pass.effective.material)} · Tổng {formatKg(w.grossKg)} – Bì {formatKg(w.tareKg)}</p>
-          <p>{offline === true ? "Đã lưu tại trạm • Chờ đồng bộ" : w.source === "mock" ? "Cân giả lập (chờ nối trạm cân thật)" : `Trạm ${w.scaleId}`}</p>
+          <p>
+            {offline === true
+              ? "Đã lưu tại trạm • Chờ đồng bộ"
+              : w.source === "mock"
+                ? "Cân giả lập (chờ nối trạm cân thật)"
+                : w.source === "manual"
+                  ? "Nhập từ Excel (mất điện)"
+                  : `Trạm ${w.scaleId}`}
+          </p>
         </div>
       )}
     </div>
@@ -346,6 +352,7 @@ export function PhienCanPanel({ pass, catalog, offline, editable = true }: { pas
 
 export function ResolvePanel({ pass, catalog }: { pass: GatePass; catalog: Catalog | undefined }): ReactElement {
   const queryClient = useQueryClient();
+  const { currentSiteId } = useAuth();
   const [plate, setPlate] = useState("");
   const [vehicleType, setVehicleType] = useState("");
   const [material, setMaterial] = useState("");
@@ -354,7 +361,7 @@ export function ResolvePanel({ pass, catalog }: { pass: GatePass; catalog: Catal
 
   const mutation = useMutation({
     mutationFn: (decision: "confirm" | "reject") =>
-      postJson<GatePass>(`/passes/${pass.id}/${decision}`, {
+      postJson<GatePass>(`/passes/${pass.id}/${decision}${siteQuery(currentSiteId)}`, {
         plateNumber: plate || undefined,
         vehicleType: vehicleType || undefined,
         material: material || undefined,
@@ -442,7 +449,14 @@ export function PassDetail({ pass, catalog, offline, editable = true }: { pass: 
                 <p className="muted-text">Chưa nhận số liệu cân khớp với lượt xe này.</p>
               ) : (
                 <dl className="gate-facts">
-                  <div><dt>Phiếu / trạm</dt><dd>{selected.weighing.ticketNo ?? "—"} · {selected.weighing.scaleId}{selected.weighing.source === "mock" && <small>Cân giả lập (random khi chụp)</small>}</dd></div>
+                  <div>
+                    <dt>Phiếu / trạm</dt>
+                    <dd>
+                      {selected.weighing.ticketNo ?? "—"} · {selected.weighing.scaleId}
+                      {selected.weighing.source === "mock" && <small>Cân giả lập (random khi chụp)</small>}
+                      {selected.weighing.source === "manual" && <small>Nhập từ Excel (mất điện)</small>}
+                    </dd>
+                  </div>
                   <div><dt>Biển số trên phiếu</dt><dd>{selected.weighing.plateNumber ?? "—"}</dd></div>
                   <div><dt>Thời điểm cân tổng</dt><dd>{selected.weighing.grossAt === null ? "—" : formatTime(selected.weighing.grossAt)}</dd></div>
                   <div><dt>Thời điểm cân bì</dt><dd>{selected.weighing.tareAt === null ? "Xe còn trong bãi" : formatTime(selected.weighing.tareAt)}</dd></div>
@@ -478,15 +492,22 @@ export function useGateCatalog(): Catalog | undefined {
 type GateEvent = { type: "upsert"; pass: GatePass } | { type: "remove"; id: string };
 const byCapturedAtDesc = (first: GatePass, second: GatePass): number => second.capture.capturedAt.localeCompare(first.capture.capturedAt);
 
-/** Nguồn dữ liệu lượt xe dùng chung cho mọi trang: tải danh sách rồi giữ đồng bộ qua SSE. Một phiên đăng ký cho cả ứng dụng. */
-export function useGateFeed(): { rows: GatePass[]; connected: boolean; message: string | null } {
+export function siteQuery(siteId: string | null): string {
+  return siteId === null ? "" : `?siteId=${encodeURIComponent(siteId)}`;
+}
+
+/** Nguồn dữ liệu lượt xe dùng chung cho mọi trang: tải danh sách rồi giữ đồng bộ qua SSE. Một phiên
+ *  đăng ký cho cả ứng dụng. siteId=null = ADMIN đang xem "Tất cả cơ sở" (không lọc). Tải lại/kết nối
+ *  lại mỗi khi đổi cơ sở đang chọn. */
+export function useGateFeed(siteId: string | null): { rows: GatePass[]; connected: boolean; message: string | null } {
   const [rows, setRows] = useState<GatePass[]>([]);
   const [connected, setConnected] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    void request<GatePass[]>("/passes")
+    setRows([]);
+    void request<GatePass[]>(`/passes${siteQuery(siteId)}`)
       .then((passes) => {
         if (!cancelled) {
           // Gộp với sự kiện đã tới trong lúc tải để không mất dòng nào.
@@ -498,7 +519,7 @@ export function useGateFeed(): { rows: GatePass[]; connected: boolean; message: 
           setMessage(error instanceof Error ? error.message : "Không tải được danh sách lượt xe.");
         }
       });
-    const source = new EventSource(`${API_BASE_URL}/live/events`);
+    const source = new EventSource(`${API_BASE_URL}/live/events${siteQuery(siteId)}`, { withCredentials: true });
     source.onopen = () => setConnected(true);
     source.onerror = () => setConnected(false);
     source.onmessage = (event: MessageEvent<string>) => {
@@ -520,7 +541,7 @@ export function useGateFeed(): { rows: GatePass[]; connected: boolean; message: 
       cancelled = true;
       source.close();
     };
-  }, []);
+  }, [siteId]);
 
   return { rows, connected, message };
 }

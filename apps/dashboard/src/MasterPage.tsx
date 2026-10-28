@@ -1,10 +1,11 @@
 import { FormEvent, ReactElement, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "./AuthContext";
 import { API_BASE_URL, useGateCatalog } from "./PassDetail";
 
 interface Driver {
   id: string;
-  vehicleId: string;
+  vehicleId: string | null;
   fullName: string;
   phone: string;
   licenseNo: string;
@@ -20,9 +21,11 @@ interface Vehicle {
   drivers: Driver[];
 }
 
-async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}/master${path}`, {
+async function api<T>(path: string, method = "GET", body?: unknown, base = "/master", siteId?: string | null): Promise<T> {
+  const qs = siteId !== null && siteId !== undefined ? `?siteId=${encodeURIComponent(siteId)}` : "";
+  const response = await fetch(`${API_BASE_URL}${base}${path}${qs}`, {
     method,
+    credentials: "include",
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
@@ -40,13 +43,17 @@ const EMPTY_DRIVER = { fullName: "", phone: "", licenseNo: "", note: "", isPrima
 export default function MasterPage(): ReactElement {
   const queryClient = useQueryClient();
   const catalog = useGateCatalog();
+  const { currentSiteId } = useAuth();
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [vehicleForm, setVehicleForm] = useState<(typeof EMPTY_VEHICLE & { id?: string }) | null>(null);
   const [driverForm, setDriverForm] = useState<(typeof EMPTY_DRIVER & { id?: string }) | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
-  const vehiclesQuery = useQuery({ queryKey: ["master-vehicles"], queryFn: () => api<Vehicle[]>("/vehicles") });
+  const vehiclesQuery = useQuery({
+    queryKey: ["master-vehicles", currentSiteId],
+    queryFn: () => api<Vehicle[]>("/vehicles", "GET", undefined, "/master", currentSiteId)
+  });
   const refresh = (): void => {
     void queryClient.invalidateQueries({ queryKey: ["master-vehicles"] });
     void queryClient.invalidateQueries({ queryKey: ["gate-passes-table"] });
@@ -55,7 +62,9 @@ export default function MasterPage(): ReactElement {
   const saveVehicle = useMutation({
     mutationFn: (form: NonNullable<typeof vehicleForm>) => {
       const body = { plateNumber: form.plateNumber, vehicleType: form.vehicleType === "" ? null : form.vehicleType, note: form.note };
-      return form.id === undefined ? api<Vehicle>("/vehicles", "POST", body) : api<Vehicle>(`/vehicles/${form.id}`, "PATCH", body);
+      return form.id === undefined
+        ? api<Vehicle>("/vehicles", "POST", body, "/master", currentSiteId)
+        : api<Vehicle>(`/vehicles/${form.id}`, "PATCH", body, "/master", currentSiteId);
     },
     onSuccess: (vehicle) => {
       setVehicleForm(null);
@@ -66,16 +75,16 @@ export default function MasterPage(): ReactElement {
     onError
   });
   const removeVehicle = useMutation({
-    mutationFn: (id: string) => api<{ removedDrivers: number }>(`/vehicles/${id}`, "DELETE"),
+    mutationFn: (id: string) => api<{ unlinkedDrivers: number }>(`/vehicles/${id}`, "DELETE", undefined, "/master", currentSiteId),
     onSuccess: (result) => {
       setSelectedId(null);
-      setMessage(`Đã xoá xe và ${result.removedDrivers} tài xế.`);
+      setMessage(result.unlinkedDrivers === 0 ? "Đã xoá xe." : `Đã xoá xe, gỡ liên kết ${result.unlinkedDrivers} tài xế (vẫn còn trong danh sách Tài xế).`);
       refresh();
     },
     onError
   });
   const importCaptured = useMutation({
-    mutationFn: () => api<{ created: number; skipped: number }>("/vehicles/import-captured", "POST"),
+    mutationFn: () => api<{ created: number; skipped: number }>("/vehicles/import-captured", "POST", undefined, "/master", currentSiteId),
     onSuccess: (result) => {
       setMessage(`Đã nhập ${result.created} xe mới, bỏ qua ${result.skipped} biển đã có.`);
       refresh();
@@ -85,7 +94,9 @@ export default function MasterPage(): ReactElement {
   const saveDriver = useMutation({
     mutationFn: (form: NonNullable<typeof driverForm>) => {
       const { id, ...body } = form;
-      return id === undefined ? api<Driver>(`/vehicles/${selectedId!}/drivers`, "POST", body) : api<Driver>(`/drivers/${id}`, "PATCH", body);
+      return id === undefined
+        ? api<Driver>(`/vehicles/${selectedId!}/drivers`, "POST", body, "/master", currentSiteId)
+        : api<Driver>(`/${id}`, "PATCH", body, "/drivers", currentSiteId);
     },
     onSuccess: () => {
       setDriverForm(null);
@@ -95,7 +106,7 @@ export default function MasterPage(): ReactElement {
     onError
   });
   const removeDriver = useMutation({
-    mutationFn: (id: string) => api<{ ok: true }>(`/drivers/${id}`, "DELETE"),
+    mutationFn: (id: string) => api<{ ok: true }>(`/${id}`, "DELETE", undefined, "/drivers", currentSiteId),
     onSuccess: refresh,
     onError
   });
@@ -120,7 +131,7 @@ export default function MasterPage(): ReactElement {
     }
   };
   const confirmRemoveVehicle = (vehicle: Vehicle): void => {
-    if (window.confirm(`Xoá xe ${vehicle.plateNumber} và ${vehicle.drivers.length} tài xế của xe này?`)) {
+    if (window.confirm(`Xoá xe ${vehicle.plateNumber}? Tài xế của xe này sẽ không bị xoá, chỉ gỡ liên kết.`)) {
       removeVehicle.mutate(vehicle.id);
     }
   };
@@ -161,12 +172,12 @@ export default function MasterPage(): ReactElement {
 
         <div className="sheet-wrap">
           <table className="sheet compact">
-            <thead><tr><th>Biển số</th><th>Loại xe</th><th>Tài xế</th><th>Ghi chú</th><th /></tr></thead>
+            <thead><tr><th className="cell-center">Biển số</th><th>Loại xe</th><th>Tài xế</th><th>Ghi chú</th><th /></tr></thead>
             <tbody>
               {vehicles.length === 0 && <tr><td className="cell-empty" colSpan={5}>Chưa có xe. Bấm Thêm xe hoặc Nhập từ ảnh đã chụp.</td></tr>}
               {vehicles.map((vehicle) => (
                 <tr className={`clickable ${vehicle.id === selectedId ? "row-selected" : ""}`} key={vehicle.id} onClick={() => setSelectedId(vehicle.id)}>
-                  <td className="cell-plate">{vehicle.plateNumber}</td>
+                  <td className="cell-center"><span className="cell-plate">{vehicle.plateNumber}</span></td>
                   <td>{typeLabel(vehicle.vehicleType)}</td>
                   <td>{vehicle.drivers.length === 0 ? "—" : vehicle.drivers.map((driver) => driver.fullName).join(", ")}</td>
                   <td>{vehicle.note}</td>

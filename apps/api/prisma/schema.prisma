@@ -14,25 +14,33 @@ datasource db {
   provider = "postgresql"
 }
 
-/// Một xe trong danh sách master data của bãi.
+/// Một xe trong danh sách master data của bãi. Thuộc về 1 account (ownerId) — dùng chung giữa mọi
+/// Site của account đó, không theo từng Site. 2 account khác nhau được ghi nhận cùng 1 biển số thật
+/// (không coi là trùng) nên unique theo cặp [ownerId, plateNormalized], không unique toàn cục.
 model Vehicle {
   id               String   @id @default(uuid())
+  ownerId          String
+  owner            User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   plateNumber      String
-  plateNormalized  String   @unique
+  plateNormalized  String
   vehicleType      String?
   note             String   @default("")
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
   drivers          Driver[]
 
-  @@index([plateNormalized])
+  @@unique([ownerId, plateNormalized])
+  @@index([ownerId])
 }
 
-/// Tài xế gắn với một xe; xoá xe thì xoá luôn tài xế của xe đó.
+/// Tài xế — master data độc lập, thuộc về 1 account (ownerId, như Vehicle), có thể gắn hoặc chưa
+/// gắn với một xe của CHÍNH account đó. Xoá xe chỉ gỡ liên kết (vehicleId về null), không xoá tài xế.
 model Driver {
   id         String   @id @default(uuid())
-  vehicleId  String
-  vehicle    Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  ownerId    String
+  owner      User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  vehicleId  String?
+  vehicle    Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
   fullName   String
   phone      String   @default("")
   licenseNo  String   @default("")
@@ -41,12 +49,72 @@ model Driver {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
+  @@index([ownerId])
   @@index([vehicleId])
 }
 
-/// Một lượt xe (vào, có thể cả ra), gộp camera + cân + kiểm tra chéo + nhật ký.
+enum Role {
+  ADMIN
+  USER
+}
+
+/// Tài khoản đăng nhập dashboard. Không có đăng ký công khai — chỉ ADMIN tạo tài khoản cho USER.
+/// Role USER = 1 đối tác (account), có thể sở hữu nhiều Site + master data (Vehicle/Driver) riêng.
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         Role      @default(USER)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  lastLoginAt  DateTime?
+  sites        Site[]
+  vehicles     Vehicle[]
+  drivers      Driver[]
+}
+
+/// Một cơ sở (mỏ đá/mỏ cát/trạm bê tông...) của 1 account — có camera + trạm cân riêng. scaleId/
+/// cameraId (trong SiteCamera) phải unique TOÀN CỤC vì pipeline Python/trạm cân ngoài chỉ gửi đúng
+/// 1 chuỗi đó, không gửi kèm site/account nào — API tự suy ra site từ đúng chuỗi này.
+model Site {
+  id                String       @id @default(uuid())
+  ownerId           String
+  owner             User         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name              String
+  scaleId           String       @unique
+  weighbridgeApiKey String
+  cameras           SiteCamera[]
+  gatePasses        GatePass[]
+  weighReadings     WeighReading[]
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([ownerId])
+}
+
+/// 1 camera của 1 Site. rtspUrl lưu để cấu hình/hiển thị — pipeline.py hiện vẫn chạy tay bằng CLI
+/// args (<rtspUrl> <cameraId>), CHƯA tự đọc cấu hình này (xem docs/hikvision-rtsp-deployment.md).
+model SiteCamera {
+  id        String   @id @default(uuid())
+  siteId    String
+  site      Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  cameraId  String   @unique
+  label     String   @default("")
+  rtspUrl   String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([siteId])
+}
+
+/// Một lượt xe (vào, có thể cả ra), gộp camera + cân + kiểm tra chéo + nhật ký. Thuộc về 1 Site
+/// (siteId) — resolve từ cameraId lúc ingestDetection(), xem gate-passes.service.ts.
 model GatePass {
   id              String    @id @default(uuid())
+  siteId          String
+  site            Site      @relation(fields: [siteId], references: [id], onDelete: Cascade)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -80,6 +148,7 @@ model GatePass {
 
   readings        WeighReading[]
 
+  @@index([siteId])
   @@index([plateNormalized])
   @@index([status])
   @@index([resolution])
@@ -87,8 +156,11 @@ model GatePass {
 }
 
 /// Một lần cân từ trạm cân ngoài (hoặc giả lập); chỉ có grossKg hoặc tareKg, không có cả hai.
+/// Thuộc về 1 Site — resolve từ scaleId lúc ingestReading(), xem gate-passes.service.ts.
 model WeighReading {
   id          String    @id @default(uuid())
+  siteId      String
+  site        Site      @relation(fields: [siteId], references: [id], onDelete: Cascade)
   scaleId     String
   ticketNo    String?
   plateNumber String?
@@ -101,6 +173,7 @@ model WeighReading {
   gatePassId  String?
   gatePass    GatePass? @relation(fields: [gatePassId], references: [id], onDelete: SetNull)
 
+  @@index([siteId])
   @@index([gatePassId])
   @@index([plateNumber])
 }

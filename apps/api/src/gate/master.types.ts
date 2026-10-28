@@ -1,5 +1,6 @@
 export interface Vehicle {
   id: string;
+  ownerId: string;
   plateNumber: string;
   plateNormalized: string;
   /** Mã trong gate.catalog.ts hoặc null nếu chưa biết. */
@@ -11,7 +12,8 @@ export interface Vehicle {
 
 export interface Driver {
   id: string;
-  vehicleId: string;
+  ownerId: string;
+  vehicleId: string | null;
   fullName: string;
   phone: string;
   licenseNo: string;
